@@ -18,6 +18,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Override the project's rust-toolchain.toml (which pins a Windows-GNU triple
+    # for local dev on a no-Win-SDK box). On the Linux runner we want the host's
+    # default stable. RUSTUP_TOOLCHAIN takes precedence over rust-toolchain.toml.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
 
