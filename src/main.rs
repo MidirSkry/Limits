@@ -93,7 +93,8 @@ fn zoom_camera(
 
 // When LIMITS_BENCH_EXIT_AFTER=<seconds> is set, the process exits after that elapsed
 // wall time. Bypasses Bevy's messaging system on purpose — it's just a bench escape
-// hatch, not part of normal app lifecycle.
+// hatch, not part of normal app lifecycle. Disabled on wasm (no env vars, no exit).
+#[cfg(not(target_arch = "wasm32"))]
 fn bench_auto_exit(time: Res<Time>) {
     static SECS: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
     let limit = SECS.get_or_init(|| {
@@ -107,6 +108,9 @@ fn bench_auto_exit(time: Res<Time>) {
         }
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+fn bench_auto_exit() {}
 
 fn update_hud(
     diagnostics: Res<DiagnosticsStore>,

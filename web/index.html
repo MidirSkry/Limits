@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#000000">
+    <title>[Limits] — Bevy stress test</title>
+
+    <!-- trunk picks up these directives at build time -->
+    <link data-trunk rel="rust" data-bin="limits" data-wasm-opt="z" />
+    <!-- Bevy's AssetPlugin file_path is "Images"; copy the dir into dist/ so the
+         deployed page can fetch Images/Warrior_Run.png alongside index.html. -->
+    <link data-trunk rel="copy-dir" href="../Images" />
+
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            height: 100%;
+            background: #000;
+            font-family: -apple-system, system-ui, sans-serif;
+            color: #ccc;
+        }
+        /* Bevy/winit creates the canvas. Make it fill the viewport and disable the
+           default touch gestures that would otherwise scroll/pinch the page. */
+        canvas {
+            display: block;
+            width: 100vw !important;
+            height: 100vh !important;
+            touch-action: none;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+        #loading {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            opacity: 0.6;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">loading wasm…</div>
+    <script>
+        // Hide the loading text once the canvas appears.
+        const observer = new MutationObserver(() => {
+            if (document.querySelector('canvas')) {
+                const el = document.getElementById('loading');
+                if (el) el.remove();
+                observer.disconnect();
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    </script>
+</body>
+</html>

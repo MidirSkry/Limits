@@ -1,0 +1,7 @@
+# Tell trunk where the entrypoint HTML lives. Default is `index.html` at the repo
+# root; we keep ours under web/ to avoid cluttering the project root.
+[build]
+target = "web/index.html"
+release = true
+# `dist/` is the conventional output dir; CI uploads it to GitHub Pages.
+dist = "dist"
