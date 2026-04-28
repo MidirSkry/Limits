@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bevy / dynamic_linking sidecar artifacts (in case any escape /target)
+bevy_dylib*.dll
+bevy_dylib*.pdb

@@ -1,0 +1,13 @@
+# Pin a default toolchain for this project.
+#
+# `x86_64-pc-windows-gnu` is used because it ships a self-contained mingw-w64
+# linker bundled with rustup — no Windows SDK install required. This keeps the
+# project bootstrappable on a stock Windows machine without the multi-GB
+# "Visual Studio Build Tools + Windows 10 SDK" download.
+#
+# If you have the Windows SDK installed and want the MSVC ABI for parity with
+# typical Bevy CI / shipping configs, change this to:
+#     channel = "stable-x86_64-pc-windows-msvc"
+# and the .cargo/config.toml `rust-lld` entry will activate automatically.
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"

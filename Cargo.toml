@@ -1,0 +1,27 @@
+[package]
+name = "limits"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+# Enable with `cargo run --features dev` for fast iteration via dynamic linking.
+# Release builds intentionally do NOT enable this so binaries stay statically linked.
+dev = ["bevy/dynamic_linking"]
+
+[dependencies]
+bevy = "0.18.1"
+
+# Optimize our own crate lightly so debug-build runtime is bearable at 100k+ entities,
+# and optimize all dependencies (including Bevy) fully — this is the standard Bevy
+# "fast compile, fast run" dev profile.
+[profile.dev]
+opt-level = 1
+split-debuginfo = "packed"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Release uses defaults: opt-level=3, codegen-units=16, no LTO. Add LTO later only if
+# profiling shows it helps — it triples link time.

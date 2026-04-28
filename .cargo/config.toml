@@ -1,0 +1,15 @@
+# Windows fast-link configuration.
+#
+# MSVC ABI: Bevy's 0.18 docs recommend `rust-lld.exe` for the link step. It's
+# bundled with rustup so no extra install is needed BEYOND a working Windows
+# SDK (kernel32.lib, etc., which ship with VS Build Tools / Windows 10 SDK).
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
+# GNU ABI: the default rustup-bundled mingw-w64 ld is fast enough; no override
+# needed. This lets the project build on a stock Windows machine without the
+# Windows SDK. See rust-toolchain.toml for which ABI is the default here.
+
+# Note: split-debuginfo is set per-profile in Cargo.toml, not here, because cargo
+# config rustflags would invalidate dependency caches across crates that don't share
+# this config.
