@@ -46,16 +46,24 @@
 </head>
 <body>
     <div id="loading">loading wasm…</div>
+    <!-- Pre-place the canvas so winit/Bevy can bind to it by id; without this,
+         Bevy creates one but layout can race with our CSS and end up zero-sized
+         on some browsers, which presents as a black screen. -->
+    <canvas id="bevy"></canvas>
     <script>
-        // Hide the loading text once the canvas appears.
-        const observer = new MutationObserver(() => {
-            if (document.querySelector('canvas')) {
+        // Hide the loading text once Bevy has resized the canvas (sign it's running).
+        const canvas = document.getElementById('bevy');
+        const start = performance.now();
+        const tick = () => {
+            if (canvas.width > 0 && canvas.height > 0) {
                 const el = document.getElementById('loading');
                 if (el) el.remove();
-                observer.disconnect();
+                return;
             }
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
+            if (performance.now() - start > 30000) return; // give up after 30s
+            requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
     </script>
 </body>
 </html>

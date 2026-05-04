@@ -25,6 +25,13 @@ fn main() {
                     primary_window: Some(Window {
                         title: "[Limits] — Bevy 0.18 stress test".into(),
                         present_mode: bevy::window::PresentMode::AutoNoVsync,
+                        // On wasm, attach Bevy's renderer to the <canvas id="bevy">
+                        // element in index.html. Ignored on desktop. fit_canvas_to_parent
+                        // tracks the body's size so CSS resizing actually changes the
+                        // render-target resolution (otherwise we'd render at 1280x720
+                        // and the browser would stretch it).
+                        canvas: Some("#bevy".to_string()),
+                        fit_canvas_to_parent: true,
                         ..default()
                     }),
                     ..default()
