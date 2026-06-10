@@ -16,12 +16,20 @@ use std::collections::HashMap;
 use crate::player::PlayerState;
 use crate::world::{self, Asteroid, CELL_M};
 
-/// How far out impostors exist. Beyond this, rocks are smaller than a pixel
-/// or close to it — the starfield carries the rest.
-const IMPOSTOR_RADIUS_M: f32 = 520.0;
-/// Hide the impostor when the player is this close to the asteroid center —
-/// by then the voxel chunks are streamed in and take over.
-const SWAP_M: f32 = 40.0;
+/// How far out impostors exist. At this range even the biggest rock is a
+/// couple dozen pixels, and grow-in hides the birth.
+const IMPOSTOR_RADIUS_M: f32 = 850.0;
+/// Hide the impostor when the player is this close to the asteroid center.
+/// By then the streamed voxel shell has already drawn over it (see INSET_M),
+/// so the hide itself is invisible.
+const SWAP_M: f32 = 38.0;
+/// Impostors sit this far INSIDE the true surface: voxel cubes quantize
+/// outward from the noise surface, so an inset impostor gets shrouded by the
+/// real chunks as they stream in — the rock "resolves" into voxels instead
+/// of flipping representation.
+const INSET_M: f32 = 0.30;
+/// New impostors scale up over this long so frontier spawns emerge softly.
+const GROW_S: f32 = 1.1;
 /// Impostor meshes built per frame (each ~160 verts; keep hitches invisible).
 const BUILD_BUDGET: usize = 12;
 /// Frames between discovery/cleanup sweeps.
@@ -39,6 +47,7 @@ impl Plugin for LodPlugin {
 #[derive(Component)]
 struct Impostor {
     center: Vec3,
+    age: f32,
 }
 
 #[derive(Resource, Default)]
@@ -81,6 +90,14 @@ fn impostor_sweep(
             }
         }
     }
+
+    // Nearest rocks build first: pop() takes from the end, so sort far-first.
+    let ppos = player.pos;
+    imp.queue.sort_by(|a, b| {
+        let da = ((a.as_vec3() + Vec3::splat(0.5)) * CELL_M).distance_squared(ppos);
+        let db = ((b.as_vec3() + Vec3::splat(0.5)) * CELL_M).distance_squared(ppos);
+        db.total_cmp(&da)
+    });
 
     // Cleanup pass: drop impostors well outside the radius.
     let limit = IMPOSTOR_RADIUS_M * 1.2;
@@ -132,8 +149,11 @@ fn impostor_build(
             .spawn((
                 Mesh3d(meshes.add(impostor_mesh(&a))),
                 MeshMaterial3d(material.clone()),
-                Transform::from_translation(a.center),
-                Impostor { center: a.center },
+                Transform::from_translation(a.center).with_scale(Vec3::splat(0.01)),
+                Impostor {
+                    center: a.center,
+                    age: 0.0,
+                },
             ))
             .id();
         imp.map.insert(cell, entity);
@@ -156,7 +176,10 @@ fn impostor_mesh(a: &Asteroid) -> Mesh {
     let mut colors = Vec::with_capacity(dirs.len());
     for (i, d) in dirs.iter().enumerate() {
         let dir = Vec3::from(*d).normalize_or_zero();
+        // Quantize to voxel steps (terraced silhouette like the real rock),
+        // then tuck inside the true surface so streamed chunks shroud us.
         let r = a.surface_toward(a.center + dir);
+        let r = ((r / world::VOXEL).floor() * world::VOXEL - INSET_M).max(1.0);
         positions.push([dir.x * r, dir.y * r, dir.z * r]);
         // Sphere-smooth normals are fine at impostor distances.
         normals.push([dir.x, dir.y, dir.z]);
@@ -181,12 +204,22 @@ fn impostor_mesh(a: &Asteroid) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// Per frame: impostors near the player yield to the real voxel chunks.
+/// Per frame: grow new impostors in, and yield to the voxel chunks up close
+/// (by which point the streamed shell has already drawn over us).
 fn impostor_swap(
+    time: Res<Time>,
     player: Res<PlayerState>,
-    mut impostors: Query<(&Impostor, &mut Visibility)>,
+    mut impostors: Query<(&mut Impostor, &mut Visibility, &mut Transform)>,
 ) {
-    for (imp, mut vis) in &mut impostors {
+    let dt = time.delta_secs();
+    for (mut imp, mut vis, mut tf) in &mut impostors {
+        if imp.age < GROW_S {
+            imp.age += dt;
+            let t = (imp.age / GROW_S).clamp(0.0, 1.0);
+            // Ease-out growth.
+            let s = 1.0 - (1.0 - t) * (1.0 - t);
+            tf.scale = Vec3::splat(s.max(0.01));
+        }
         *vis = if imp.center.distance(player.pos) < SWAP_M {
             Visibility::Hidden
         } else {
