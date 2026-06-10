@@ -62,7 +62,7 @@ const ORE_CHANCE_CORE: f32 = 0.10;
 const GEN_RADIUS: i32 = 14;
 const UNLOAD_RADIUS: i32 = 20;
 /// Max chunks generated per frame (nearest first).
-const GEN_BUDGET: usize = 48;
+const GEN_BUDGET: usize = 28;
 /// Max chunk remeshes per frame.
 const REMESH_BUDGET: usize = 12;
 
@@ -276,10 +276,103 @@ impl Asteroid {
         self.radius * (DISP_BASE + DISP_AMP * fbm(dir * 2.0 + s, 3, self.seed))
     }
 
-    pub fn contains(&self, p: Vec3) -> bool {
-        let d = p.distance(self.center);
-        d <= self.reach() && d <= self.surface_toward(p)
+}
+
+// ---------------------------------------------------------------------------
+// Surface field — the expensive fbm displacement evaluated on a coarse 1m
+// lattice and trilinearly interpolated per voxel. Noise features are ≥2m, so
+// the lattice loses nothing visible while cutting per-voxel cost ~5-10x
+// (4096 fbm calls per rock chunk used to make flight a slideshow). Both the
+// chunked generator and the single-voxel fallback interpolate from the SAME
+// pure lattice function, so they stay bit-identical — the
+// chunk_storage_matches_pure_gen test enforces it.
+// ---------------------------------------------------------------------------
+
+/// Lattice spacing (m).
+const FIELD_L: f32 = 1.0;
+
+/// Exact signed "depth inside the surface" at a global lattice point
+/// (positive = inside rock). Pure function of (asteroid, lattice coords).
+fn field_lattice(a: &Asteroid, q: IVec3) -> f32 {
+    let p = q.as_vec3() * FIELD_L;
+    a.surface_toward(p) - p.distance(a.center)
+}
+
+/// Trilinear interpolation with a fixed operation order, shared by every
+/// caller so results are bit-identical regardless of where corners come from.
+fn trilerp_at(p: Vec3, mut corner: impl FnMut(IVec3) -> f32) -> f32 {
+    let g = p / FIELD_L;
+    let f = g.floor();
+    let q0 = f.as_ivec3();
+    let u = g - f;
+    let c = |dx: i32, dy: i32, dz: i32, corner: &mut dyn FnMut(IVec3) -> f32| {
+        corner(q0 + IVec3::new(dx, dy, dz))
+    };
+    let x00 = c(0, 0, 0, &mut corner) * (1.0 - u.x) + c(1, 0, 0, &mut corner) * u.x;
+    let x10 = c(0, 1, 0, &mut corner) * (1.0 - u.x) + c(1, 1, 0, &mut corner) * u.x;
+    let x01 = c(0, 0, 1, &mut corner) * (1.0 - u.x) + c(1, 0, 1, &mut corner) * u.x;
+    let x11 = c(0, 1, 1, &mut corner) * (1.0 - u.x) + c(1, 1, 1, &mut corner) * u.x;
+    let y0 = x00 * (1.0 - u.y) + x10 * u.y;
+    let y1 = x01 * (1.0 - u.y) + x11 * u.y;
+    y0 * (1.0 - u.z) + y1 * u.z
+}
+
+/// Precomputed lattice values covering one chunk for one asteroid.
+struct FieldGrid {
+    origin: IVec3,
+    n: IVec3,
+    values: Vec<f32>,
+}
+
+impl FieldGrid {
+    fn for_box(a: &Asteroid, min_m: Vec3, max_m: Vec3) -> Self {
+        let origin = (min_m / FIELD_L).floor().as_ivec3();
+        let top = (max_m / FIELD_L).ceil().as_ivec3() + IVec3::ONE;
+        let n = top - origin + IVec3::ONE;
+        let mut values = Vec::with_capacity((n.x * n.y * n.z) as usize);
+        for z in 0..n.z {
+            for y in 0..n.y {
+                for x in 0..n.x {
+                    values.push(field_lattice(a, origin + IVec3::new(x, y, z)));
+                }
+            }
+        }
+        Self { origin, n, values }
     }
+
+    #[inline]
+    fn at(&self, q: IVec3) -> f32 {
+        let l = q - self.origin;
+        self.values[(l.x + l.y * self.n.x + l.z * self.n.x * self.n.y) as usize]
+    }
+
+    #[inline]
+    fn sample(&self, p: Vec3) -> f32 {
+        trilerp_at(p, |q| self.at(q))
+    }
+}
+
+/// Field for a single arbitrary point — the fallback/raycast path.
+fn field_single(a: &Asteroid, p: Vec3) -> f32 {
+    trilerp_at(p, |q| field_lattice(a, q))
+}
+
+/// Classify a voxel given its interpolated field depth (None = vacuum).
+fn classify(a: &Asteroid, v: IVec3, p: Vec3, f: f32) -> Option<u8> {
+    if f <= 0.0 {
+        return None;
+    }
+    if f < SHELL_M {
+        return Some(REGOLITH);
+    }
+    let d = p.distance(a.center);
+    let surf = d + f;
+    if d < surf * CORE_FRAC {
+        return Some(ORE);
+    }
+    let frac = d / surf;
+    let chance = ORE_CHANCE_BASE + ORE_CHANCE_CORE * (1.0 - frac) * (1.0 - frac);
+    Some(if hash_unit(v, 0xA17E) < chance { ORE } else { ROCK })
 }
 
 fn cell_of(p: Vec3) -> IVec3 {
@@ -365,38 +458,19 @@ fn voxel_center_m(v: IVec3) -> Vec3 {
     (v.as_vec3() + Vec3::splat(0.5)) * VOXEL
 }
 
-/// Block id at a voxel given the asteroids that could cover it.
-fn block_in(asteroids: &[Asteroid], v: IVec3) -> u8 {
-    let p = voxel_center_m(v);
-    for a in asteroids {
-        let d = p.distance(a.center);
-        if d > a.reach() {
-            continue;
-        }
-        let surf = a.surface_toward(p);
-        if d > surf {
-            continue;
-        }
-        if surf - d < SHELL_M {
-            return REGOLITH;
-        }
-        if d < surf * CORE_FRAC {
-            return ORE;
-        }
-        let frac = d / surf;
-        let chance = ORE_CHANCE_BASE + ORE_CHANCE_CORE * (1.0 - frac) * (1.0 - frac);
-        if hash_unit(v, 0xA17E) < chance {
-            return ORE;
-        }
-        return ROCK;
-    }
-    AIR
-}
-
-/// Pure worldgen for one voxel (slow path: looks up its asteroids itself).
+/// Pure worldgen for one voxel (slow path: looks up its asteroids itself and
+/// interpolates the field from raw lattice evaluations).
 pub fn block_at(v: IVec3) -> u8 {
     let p = voxel_center_m(v);
-    block_in(&asteroids_overlapping(p, p), v)
+    for a in asteroids_overlapping(p, p) {
+        if p.distance_squared(a.center) > a.reach() * a.reach() {
+            continue;
+        }
+        if let Some(b) = classify(&a, v, p, field_single(&a, p)) {
+            return b;
+        }
+    }
+    AIR
 }
 
 /// Tier of the asteroid covering this voxel (distance tier in open space).
@@ -404,7 +478,10 @@ pub fn tier_of_voxel(v: IVec3) -> i32 {
     let p = voxel_center_m(v);
     asteroids_overlapping(p, p)
         .iter()
-        .find(|a| a.contains(p))
+        .find(|a| {
+            p.distance_squared(a.center) <= a.reach() * a.reach()
+                && field_single(a, p) > 0.0
+        })
         .map_or_else(|| (p.length() / TIER_M) as i32, |a| a.tier)
 }
 
@@ -541,6 +618,15 @@ impl VoxelWorld {
             self.empty.insert(cp);
             return false;
         }
+        // One coarse field grid per overlapping asteroid; per-voxel work is
+        // then a distance check + trilerp, not an fbm evaluation.
+        let grids: Vec<(Asteroid, FieldGrid)> = asteroids
+            .into_iter()
+            .map(|a| {
+                let g = FieldGrid::for_box(&a, min_m, max_m);
+                (a, g)
+            })
+            .collect();
         let mut blocks = Box::new([0u8; CHUNK_VOL]);
         let origin = cp * CHUNK;
         let mut any_solid = false;
@@ -550,7 +636,20 @@ impl VoxelWorld {
                     let v = origin + IVec3::new(x, y, z);
                     let b = match self.edits.get(&v) {
                         Some(&e) => e,
-                        None => block_in(&asteroids, v),
+                        None => {
+                            let p = voxel_center_m(v);
+                            let mut b = AIR;
+                            for (a, grid) in &grids {
+                                if p.distance_squared(a.center) > a.reach() * a.reach() {
+                                    continue;
+                                }
+                                if let Some(id) = classify(a, v, p, grid.sample(p)) {
+                                    b = id;
+                                    break;
+                                }
+                            }
+                            b
+                        }
                     };
                     any_solid |= b != AIR;
                     blocks[local_index(v)] = b;
@@ -785,17 +884,24 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
     let mut solid = MeshScratch::new();
     let mut glow = MeshScratch::new();
 
-    // One asteroid lookup per chunk, shared by every voxel in it.
+    // One asteroid lookup + coarse field grid per chunk, shared by every
+    // voxel: tier/shell per voxel is a trilerp, not an fbm evaluation.
     let (min_m, max_m) = chunk_bounds_m(cp);
-    let asteroids = asteroids_overlapping(min_m, max_m);
+    let grids: Vec<(Asteroid, FieldGrid)> = asteroids_overlapping(min_m, max_m)
+        .into_iter()
+        .map(|a| {
+            let g = FieldGrid::for_box(&a, min_m, max_m);
+            (a, g)
+        })
+        .collect();
     let tier_at = |p: Vec3| -> (i32, bool) {
-        for a in &asteroids {
-            let d = p.distance(a.center);
-            if d <= a.reach() {
-                let surf = a.surface_toward(p);
-                if d <= surf {
-                    return (a.tier, surf - d < SHELL_M);
-                }
+        for (a, grid) in &grids {
+            if p.distance_squared(a.center) > a.reach() * a.reach() {
+                continue;
+            }
+            let f = grid.sample(p);
+            if f > 0.0 {
+                return (a.tier, f < SHELL_M);
             }
         }
         (0, false)
@@ -1179,6 +1285,48 @@ mod tests {
             println!("{row}");
         }
         assert_eq!(mismatches, 0);
+    }
+
+    /// Perf probe: worldgen + meshing cost per rock chunk. Not pass/fail.
+    /// Run with: cargo test bench_chunk --release -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_chunk_gen_and_mesh() {
+        use std::time::Instant;
+        let mut w = VoxelWorld::default();
+        let cc = chunk_of((Vec3::ZERO / VOXEL).floor().as_ivec3());
+        let r = 4; // 9^3 chunks around home = mix of rock + vacuum
+        let mut rock_chunks = Vec::new();
+
+        let t = Instant::now();
+        for z in -r..=r {
+            for y in -r..=r {
+                for x in -r..=r {
+                    let cp = cc + IVec3::new(x, y, z);
+                    if w.generate_chunk(cp) {
+                        rock_chunks.push(cp);
+                    }
+                }
+            }
+        }
+        let gen_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let total = (2 * r + 1) * (2 * r + 1) * (2 * r + 1);
+
+        let t = Instant::now();
+        for cp in &rock_chunks {
+            let _ = mesh_chunk(&w, *cp);
+        }
+        let mesh_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "gen: {gen_ms:.1} ms for {total} chunks ({} rock) = {:.3} ms/rock-chunk",
+            rock_chunks.len(),
+            gen_ms / rock_chunks.len().max(1) as f64
+        );
+        println!(
+            "mesh: {mesh_ms:.1} ms = {:.3} ms/rock-chunk",
+            mesh_ms / rock_chunks.len().max(1) as f64
+        );
     }
 
     #[test]
