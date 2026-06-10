@@ -51,11 +51,24 @@ struct Impostor {
 }
 
 #[derive(Resource, Default)]
-struct Impostors {
+pub struct Impostors {
     /// Cell -> impostor entity (PLACEHOLDER while queued for build).
     map: HashMap<IVec3, Entity>,
     queue: Vec<IVec3>,
     material: Option<Handle<StandardMaterial>>,
+}
+
+impl Impostors {
+    /// Day reset: the field reseeds, so every cached far-rock is wrong.
+    /// Despawn them all; the sweep rediscovers the new field within a frame.
+    pub fn despawn_all(&mut self, commands: &mut Commands) {
+        for (_, e) in self.map.drain() {
+            if e != Entity::PLACEHOLDER {
+                commands.entity(e).despawn();
+            }
+        }
+        self.queue.clear();
+    }
 }
 
 /// Discover asteroid cells entering range; retire impostors far behind us.
@@ -185,7 +198,7 @@ fn impostor_mesh(a: &Asteroid) -> Mesh {
         normals.push([dir.x, dir.y, dir.z]);
         let jitter = ((i as u64).wrapping_mul(0x9E37_79B9).wrapping_add(a.seed) % 255) as f32
             / 255.0;
-        let c = world::impostor_color(a.tier, jitter);
+        let c = world::impostor_color(a.species, jitter);
         colors.push([c[0], c[1], c[2], 1.0]);
     }
     let indices = base

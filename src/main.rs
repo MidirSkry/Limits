@@ -5,6 +5,7 @@ use bevy::prelude::*;
 use std::time::Duration;
 
 mod audio;
+mod blackhole;
 mod demo;
 mod game;
 mod hud;
@@ -62,6 +63,7 @@ fn main() {
             hud::HudPlugin,
             sky::SkyPlugin,
             lod::LodPlugin,
+            blackhole::BlackHolePlugin,
             audio::SoundPlugin,
             demo::DemoPlugin,
         ))

@@ -31,6 +31,12 @@ const SKYBOX_BRIGHTNESS: f32 = 400.0;
 const SUN_DIR: Vec3 = Vec3::new(0.55, 0.62, 0.30);
 const PLANET_DIR: Vec3 = Vec3::new(-0.52, 0.20, -0.70);
 const MOON_DIR: Vec3 = Vec3::new(0.05, 0.12, -0.90);
+// The new neighborhood: a rust-red rocky world, a deep ice giant, and a
+// lighthouse pulsar. Directions chosen to leave the black hole's quadrant
+// (-0.65, -0.08, 0.62) uncluttered.
+const ROCKY_DIR: Vec3 = Vec3::new(0.80, -0.18, -0.50);
+const ICE_DIR: Vec3 = Vec3::new(0.25, -0.62, 0.70);
+const PULSAR_DIR: Vec3 = Vec3::new(-0.85, 0.45, -0.25);
 
 const TWINKLE_STARS: usize = 130;
 const DUST_MOTES: usize = 70;
@@ -47,7 +53,14 @@ impl Plugin for SkyPlugin {
         .add_systems(PostStartup, setup_camera_sky)
         .add_systems(
             Update,
-            (anchor_follow, twinkle, shooting_stars, rotate_slow, dust_drift),
+            (
+                anchor_follow,
+                twinkle,
+                shooting_stars,
+                rotate_slow,
+                dust_drift,
+                comet_drift,
+            ),
         );
     }
 }
@@ -413,7 +426,119 @@ fn setup_celestials(
         ))
         .id();
 
-    commands.entity(anchor).add_children(&[sun, planet, rings, moon]);
+    // --- A rust-red rocky world with polar caps ------------------------------
+    let rocky = commands
+        .spawn((
+            Mesh3d(meshes.add(Sphere::new(95.0).mesh().uv(48, 24))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color_texture: Some(images.add(rocky_planet_texture())),
+                base_color: Color::WHITE,
+                perceptual_roughness: 1.0,
+                emissive: LinearRgba::rgb(0.010, 0.006, 0.004),
+                ..default()
+            })),
+            Transform::from_translation(ROCKY_DIR.normalize() * 1900.0)
+                .with_rotation(Quat::from_rotation_z(-0.12)),
+            RotateSlow {
+                axis: Vec3::new(-0.12, 1.0, 0.05).normalize(),
+                rate: 0.012,
+            },
+        ))
+        .id();
+
+    // --- An ice giant, deep azure, no rings ---------------------------------
+    let ice = commands
+        .spawn((
+            Mesh3d(meshes.add(Sphere::new(150.0).mesh().uv(48, 24))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color_texture: Some(images.add(ice_giant_texture())),
+                base_color: Color::WHITE,
+                perceptual_roughness: 1.0,
+                emissive: LinearRgba::rgb(0.008, 0.014, 0.030),
+                ..default()
+            })),
+            Transform::from_translation(ICE_DIR.normalize() * 2100.0)
+                .with_rotation(Quat::from_rotation_z(0.35)),
+            RotateSlow {
+                axis: Vec3::new(0.3, 1.0, -0.1).normalize(),
+                rate: 0.006,
+            },
+        ))
+        .id();
+
+    // --- A lighthouse pulsar: HDR core + two sweeping beams ------------------
+    let pulsar = commands
+        .spawn((
+            Transform::from_translation(PULSAR_DIR.normalize() * 1300.0),
+            Visibility::Visible,
+            RotateSlow {
+                axis: Vec3::new(0.2, 1.0, 0.3).normalize(),
+                rate: 1.4,
+            },
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Mesh3d(meshes.add(Sphere::new(3.0))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::linear_rgb(9.0, 10.0, 14.0),
+                    unlit: true,
+                    ..default()
+                })),
+                Transform::IDENTITY,
+            ));
+            let beam_mat = materials.add(StandardMaterial {
+                base_color: Color::linear_rgba(2.2, 2.8, 4.5, 0.30),
+                unlit: true,
+                alpha_mode: AlphaMode::Add,
+                cull_mode: None,
+                ..default()
+            });
+            let beam = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+            // Beams tilted off the spin axis so they sweep like a lighthouse.
+            for side in [-1.0f32, 1.0] {
+                p.spawn((
+                    Mesh3d(beam.clone()),
+                    MeshMaterial3d(beam_mat.clone()),
+                    Transform::from_translation(Vec3::new(side * 8.0, 0.0, side * 190.0))
+                        .looking_to(Vec3::new(side * 0.08, 0.0, side * 1.0), Vec3::Y)
+                        .with_scale(Vec3::new(2.0, 2.0, 380.0)),
+                ));
+            }
+        })
+        .id();
+
+    // --- A comet on a slow tilted orbit, tail blown anti-sunward -------------
+    let comet = commands
+        .spawn((
+            Mesh3d(meshes.add(Sphere::new(2.2))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::linear_rgb(7.0, 8.5, 9.5),
+                unlit: true,
+                ..default()
+            })),
+            Transform::IDENTITY,
+            Comet { angle: 1.3 },
+        ))
+        .with_children(|c| {
+            c.spawn((
+                Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::linear_rgba(1.6, 2.2, 2.8, 0.30),
+                    unlit: true,
+                    alpha_mode: AlphaMode::Add,
+                    cull_mode: None,
+                    ..default()
+                })),
+                // Local -Z is "away from the sun" (comet_drift orients us).
+                Transform::from_translation(Vec3::new(0.0, 0.0, -110.0))
+                    .with_scale(Vec3::new(3.5, 3.5, 220.0)),
+            ));
+        })
+        .id();
+
+    commands
+        .entity(anchor)
+        .add_children(&[sun, planet, rings, moon, rocky, ice, pulsar, comet]);
 
     // --- Foreground twinkle stars -------------------------------------------
     let star_mesh = meshes.add(Sphere::new(1.0));
@@ -508,6 +633,111 @@ fn gas_giant_texture() -> Image {
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     )
+}
+
+/// Equirect rocky-world texture: rust plains, dark maria, polar ice.
+fn rocky_planet_texture() -> Image {
+    let (w, h) = (512usize, 256usize);
+    let mut data = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let lat = y as f32 / h as f32; // 0 = north pole
+        for x in 0..w {
+            let lon = x as f32 / w as f32;
+            let p = Vec3::new(lon * 9.0, lat * 5.0, 2.0);
+            let n = fbm(p, 4, 0x5EA5);
+            let m = fbm(p * 2.3 + Vec3::splat(13.0), 3, 0x77AA);
+            let rust = Vec3::new(0.55, 0.30, 0.18);
+            let dark = Vec3::new(0.26, 0.15, 0.11);
+            let sand = Vec3::new(0.68, 0.50, 0.32);
+            let mut c = if n < 0.45 {
+                dark.lerp(rust, n / 0.45)
+            } else {
+                rust.lerp(sand, ((n - 0.45) / 0.55).powf(1.3))
+            };
+            // Mottling so the surface isn't airbrushed.
+            c *= 0.85 + 0.3 * m;
+            // Polar ice caps with a noisy edge.
+            let polar = (lat.min(1.0 - lat) * 2.0) + (m - 0.5) * 0.12;
+            if polar < 0.22 {
+                let k = (1.0 - polar / 0.22).clamp(0.0, 1.0);
+                c = c.lerp(Vec3::new(0.92, 0.94, 0.97), k * k);
+            }
+            let i = (y * w + x) * 4;
+            data[i] = (c.x.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+            data[i + 1] = (c.y.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+            data[i + 2] = (c.z.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+            data[i + 3] = 255;
+        }
+    }
+    Image::new(
+        Extent3d {
+            width: w as u32,
+            height: h as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+/// Equirect ice-giant texture: smooth azure bands, one pale storm streak.
+fn ice_giant_texture() -> Image {
+    let (w, h) = (512usize, 256usize);
+    let mut data = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let lat = y as f32 / h as f32;
+        for x in 0..w {
+            let lon = x as f32 / w as f32;
+            let wob = fbm(Vec3::new(lon * 6.0, lat * 16.0, 8.5), 3, 0x1CE9);
+            let band = lat * 14.0 + wob * 1.2;
+            let s = (band * std::f32::consts::TAU / 4.0).sin() * 0.5 + 0.5;
+            let deep = Vec3::new(0.06, 0.16, 0.38);
+            let pale = Vec3::new(0.30, 0.55, 0.78);
+            let mut c = deep.lerp(pale, s * 0.7);
+            // A single bright methane streak.
+            let streak = ((lat - 0.38).abs() * 30.0 + (wob - 0.5).abs() * 4.0).min(4.0);
+            if streak < 1.0 {
+                c = c.lerp(Vec3::new(0.80, 0.92, 0.98), (1.0 - streak) * 0.5);
+            }
+            let i = (y * w + x) * 4;
+            data[i] = (c.x.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+            data[i + 1] = (c.y.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+            data[i + 2] = (c.z.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+            data[i + 3] = 255;
+        }
+    }
+    Image::new(
+        Extent3d {
+            width: w as u32,
+            height: h as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+/// A comet crawling along a tilted circle (anchor-relative, so effectively a
+/// fixture of the sky), head always oriented so the tail streams anti-sun.
+#[derive(Component)]
+struct Comet {
+    angle: f32,
+}
+
+fn comet_drift(time: Res<Time>, mut comets: Query<(&mut Comet, &mut Transform)>) {
+    let dt = time.delta_secs();
+    let tilt = Quat::from_euler(EulerRot::XYZ, 0.45, 0.0, 0.30);
+    for (mut comet, mut tf) in &mut comets {
+        comet.angle += dt * 0.005;
+        let (sin, cos) = comet.angle.sin_cos();
+        tf.translation = tilt * Vec3::new(cos * 1050.0, 180.0, sin * 1050.0);
+        // Tail child sits along local -Z: face local -Z away from the sun.
+        tf.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, -sun_direction());
+    }
 }
 
 fn twinkle(time: Res<Time>, mut stars: Query<(&Twinkle, &mut Transform)>) {

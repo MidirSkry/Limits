@@ -1,6 +1,6 @@
 # [Limits]
 
-A Bevy 0.18 incremental space-mining game: first-person **zero-G laser mining in an open asteroid field** (0.25m voxels — the player is ~6 voxels tall). Fly out from the home rock, carve into procedural asteroids, tractor the loot, sell at the home depot, and buy laser/coolant/tractor/recall upgrades to push further out — each 120m "sector" tier doubles rock HP and raises crystal value. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
+A Bevy 0.18 incremental space-mining roguelite: first-person **zero-G laser mining in an open asteroid field** (0.25m voxels — the player is ~6 voxels tall), played against **a giant black hole that consumes the sector once per "day"**. Each ~10-minute day: fly out from the home rock, carve asteroids, tractor the loot, sell at the depot, and **spend before the horizon takes you** — when the day expires (or you stray too close) you're dragged in, the screen whites out, and a new day dawns over a **reseeded asteroid field**. Upgrades persist across days; credits, cargo, and the field do not. Each 120m "sector" tier doubles rock HP and raises crystal value. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
 
 ## Game loop & controls
 
@@ -8,19 +8,21 @@ A Bevy 0.18 incremental space-mining game: first-person **zero-G laser mining in
 - Hold **LMB** to fire the mining laser: continuous DPS vs block HP. The beam builds **heat**; at 100% it locks and vents for ~2s (red emitter, warning text). Coolant upgrades stretch fire time.
 - Every destroyed voxel drops physical loot that tractor-beams to you in range; crystals glow in the walls (tier 0 "Carbon" is deliberately modest — colors get loud further out). Asteroids are richer toward their centers and have a pure-crystal core.
 - **Q** throws a plasma charge: 2s fuse, carves a 4m sphere, loot arrives as *stacked* drops. You start with 2; more at the depot.
-- **E** at the depot pad sells the hold; **1/2/3/4/5** buy laser power / coolant loop / tractor field / recall rig / plasma charges. **T** recalls home, **G** jumps back to your farthest-reached site (after buying recall).
+- **E** at the depot pad sells the hold; **1/2/3/4/5** buy laser power / coolant loop / tractor field / recall rig / plasma charges. **T** recalls home, **G** jumps back to your farthest-reached site (after buying recall). Teleports are dead during the dive — no warping out of the horizon's grip.
+- **The black hole** (`blackhole.rs`) is the session clock: it physically approaches from ~5.6km to ~1.35km over the day while its pull ramps from 0.02 to 26 m/s² at home (thrust is 16 — past the crossover, escape is impossible). Pull applies to the player, loot drops, and plasma charges; strong pull rips a grounded player off the surface. The dive (deadline hit or horizon grazed) locks the camera onto the hole, ramps to ~700 m/s, whites out, then `day_reset` reseeds the world (`world::set_world_salt(day-1)`), clears chunks/impostors/loose entities, zeroes wallet + hold + max-range, and keeps `Upgrades` wholesale. `LIMITS_DAY_S=<secs>` shortens the day for testing.
 - HUD is graphical, not textual: procedurally-baked 12x12 **pixel icons** (no asset files; see the `Glyph` constants in `hud.rs`), stat chips (credits / range·best·sector / speed), heat bar + plasma pip circles, loot-color swatches in the hold chip, a depot panel of key-chips + icons + level dots + cost pills, and a home-icon nav marker pinned to the screen edge when the depot is off-camera. The controls reference only renders while the cursor is free. Numbers stay text; prose labels don't.
 - The whole progression curve (HP/value/cost growth factors) lives in the constants at the top of `src/game.rs` and `src/world.rs`.
 
 ## Architecture notes
 
-- World: an unbounded 3D asteroid field, chunked 16³ in all directions. A deterministic hash gives each 56m cell at most one asteroid (lumpy fbm-displaced sphere, regolith shell, ore odds rising toward a crystal core); the home rock sits at the origin. Worldgen is a pure function of voxel coords (`world::block_at`); chunks store one byte per voxel.
+- World: an unbounded 3D asteroid field, chunked 16³ in all directions. A deterministic hash gives each 56m cell at most one asteroid — **sparse (3.5% of cells) but individual**: per-seed ellipsoid stretch, displacement amplitude/frequency, and a **species** (8 palettes/names driving rock color; ore color stays tier-based so progression reads). A starter rock is guaranteed within 2 cells of home each day. The home rock sits at the origin, fixed across days. Worldgen is a pure function of (voxel coords, world salt) — `world::set_world_salt` is the one mutable input, bumped per day; tests assume salt 0 and must never change it (process-global, tests run in parallel).
 - Chunk streaming: chunks materialize nearest-first within ~56m of the player (budgeted per frame) and unload behind them. Pure-vacuum chunks cost a set entry, never storage/entities. **Player edits live in a sparse overlay** that survives unload and is re-applied on regeneration (this is also exactly what a save file would serialize). `VoxelWorld::block()` falls back to pure worldgen + edits for unmaterialized chunks, so collision/raycasts are correct anywhere. A test asserts chunk contents always equal pure gen.
 - Far-field LOD (`lod.rs`): every asteroid out to ~850m gets an **impostor** — a ~160-vert ico-sphere displaced by the same `surface_toward` noise the voxel gen uses, radius quantized to voxel steps and **inset 0.3m inside the true surface**, vertex-colored to the tier palette. Inset is the anti-pop trick: streamed voxel chunks draw OVER the impostor, so a rock "resolves" into voxels face-by-face and the final hide (38m) happens when it's already buried. New impostors grow in over ~1s, built nearest-first a few per frame, despawned far behind. This is what makes the view distance read as near-infinite; never raise raw chunk GEN_RADIUS for visibility.
 - Lighting: no shadow maps. An upward-ray **Enclosure** probe (smoothed) fades sun + ambient when you're inside rock, and drives the helmet lamp the *opposite* way (dim in daylight, bright in tunnels — they never stack). A weak cool anti-sun fill keeps shadow-side voxel faces from being void-black stripes against space.
 - Rendering: **two** naive-culled meshes per chunk, vertex-colored (no block textures): a lit mesh for rock, and an unlit mesh whose vertex colors run >1.0 for crystal faces — the HDR camera + bloom turn those into glowing ore veins. Remeshed on demand with a per-frame budget.
 - The camera carries `Hdr` + `Bloom` + `Tonemapping::TonyMcMapface` (inserted by `sky.rs` in PostStartup). Every glow in the game — laser beam, crystals, sun, depot beacon, sparks — is just an unlit material with linear color >1.0 feeding that bloom pass. Keep light intensities modest: a spotlight concentrates lumens ~10x vs a point light and will white-disc any close wall.
-- Sky (`sky.rs`): a starfield **cubemap** (milky way, nebulae, hashed stars) generated into an `Image` at startup + HDR sun ball, ringed gas giant (procedural equirect texture), moon, twinkling stars, and shooting stars — all parented to a `SkyAnchor` that follows the player, so they sit at effective infinity in the open world. Headlamp dust motes appear in tunnels. Zero texture/model assets in the repo.
+- Sky (`sky.rs`): a starfield **cubemap** (milky way, nebulae, hashed stars) generated into an `Image` at startup + HDR sun ball, ringed gas giant, rust-red rocky world with polar caps, azure ice giant (all procedural equirect textures), moon, a comet on a slow orbit (tail always anti-sun), a lighthouse pulsar with sweeping beams, twinkling stars, and shooting stars — all parented to a `SkyAnchor` that follows the player, so they sit at effective infinity. Headlamp dust motes appear in tunnels. Zero texture/model assets in the repo.
+- The black hole (`blackhole.rs`) is NOT sky furniture — it's a real world-space entity (camera far plane is 14km for it): unlit-black horizon sphere, billboarded HDR photon ring + halo (lensing reads from any angle), a doppler-beamed log-ring accretion disc, and infalling debris streaks parented to the disc so its tilt/spin come free. A synthesized dread-rumble loop rides the published `BlackHole.dread` level; HUD shows a doom gauge (day pip + horizon bar + countdown), red vignette past dread 0.45, and the whiteout/DAY-N splash.
 - Audio (`audio.rs`): every clip synthesized at startup into in-memory WAVs (`AudioSource { bytes }` — needs the `wav` cargo feature). Gameplay pushes `SfxEvent`s into the `SfxQueue` resource; loops (laser hum, jetpack, ambient drone) follow the `LaserState`/`JetState` resources. No audio files.
 - Explosions aggregate loot into **stacked drops** (`count` per drop entity, ≤14 stacks per material group) — never one drop per voxel; a 4m blast carves ~12k voxels and one-entity-per-voxel was 553k entities / 9 FPS in playtesting.
 
@@ -78,7 +80,7 @@ Don't put this project inside a directory whose name contains square brackets. B
 Don't build these yet; note them so we don't forget.
 
 - **Steam integration** — likely `bevy_steamworks` or raw `steamworks-rs`. Decision pending: which is more actively maintained against current Bevy.
-- **Save system** — needed before any real release: wallet/upgrades/max-depth plus mined-voxel diffs (worldgen is deterministic, so a save is just the diff set). serde + bincode.
+- **Save system** — needed before any real release. The day loop shrank it: only `Upgrades` + the day counter survive a day anyway, so a save is just those (mid-day state is intentionally disposable). serde + bincode.
 - **Greedy meshing + texture atlas** — naive per-face meshing is fine at current scale; revisit if hollowed-out worlds get deep enough to hurt.
 - **Spatial audio** — SFX are flat mono today; `PlaybackSettings::with_spatial` exists when it matters.
 - **Surface shadows** — DirectionalLight shadows would make the boulder field gorgeous; needs cascade tuning vs the deep shaft.
@@ -88,8 +90,10 @@ Don't build these yet; note them so we don't forget.
 ```
 src/
   main.rs    App wiring, GameplaySet, sun + fill + enclosure lighting, bench-exit hook
-  world.rs   Asteroid-field worldgen, chunk streaming + edit overlay, dual meshing
-             (lit + glow), raycast (WorldPlugin)
+  world.rs   Asteroid-field worldgen (per-day salt, species/shape variety), chunk
+             streaming + edit overlay, dual meshing (lit + glow), raycast (WorldPlugin)
+  blackhole.rs  The singularity: visuals, gravity, the day clock, dive cinematic,
+             and the day reset (BlackHolePlugin)
   player.rs  6DOF zero-G flight + surface walking, voxel AABB collision, laser
              mining + heat, Enclosure probe, beam/impact FX, viewmodel, shake (PlayerPlugin)
   items.rs   Stacked loot drops + tractor pickup, plasma charges, explosions
@@ -109,6 +113,7 @@ rust-toolchain.toml  Pins GNU ABI on this machine; see "Toolchain" above
 ## Bench & verification hooks
 
 - `LIMITS_BENCH_EXIT_AFTER=<seconds>` — process exits after that elapsed wall time.
+- `LIMITS_DAY_S=<seconds>` — shorten the black-hole day (default 600). `LIMITS_DEMO=1 LIMITS_DAY_S=10` captures the dive + dawn in the demo's fixed screenshot beats; `LIMITS_DAY_S=18` with the demo verifies a full consume→reset→day-2 cycle in the breadcrumb log.
 - `LIMITS_DEMO=1` — scripted ~25s tour (sky pan → laser to overheat → fly to the nearest neighbor asteroid → torpedo it → fly home → sell) that saves 8 PNGs into `shots/` and logs `[demo]` breadcrumbs to stderr. Combine both for a self-terminating visual smoke test:
 
 ```sh

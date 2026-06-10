@@ -35,6 +35,12 @@ pub enum SfxEvent {
     WarpDown,
     Overheat,
     Vent,
+    /// The dive begins — a long dread riser.
+    Collapse,
+    /// Crossing the horizon — sub-bass annihilation.
+    Consumed,
+    /// A new day — quiet, warm, alive.
+    Dawn,
 }
 
 #[derive(Resource, Default)]
@@ -56,7 +62,10 @@ impl Plugin for SoundPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SfxQueue>()
             .add_systems(Startup, setup_sfx)
-            .add_systems(Update, (play_queued, laser_loop_ctl, jet_loop_ctl));
+            .add_systems(
+                Update,
+                (play_queued, laser_loop_ctl, jet_loop_ctl, dread_loop_ctl),
+            );
     }
 }
 
@@ -77,7 +86,14 @@ struct Sfx {
     warp_down: Handle<AudioSource>,
     overheat: Handle<AudioSource>,
     vent: Handle<AudioSource>,
+    collapse: Handle<AudioSource>,
+    consumed: Handle<AudioSource>,
+    dawn: Handle<AudioSource>,
 }
+
+/// Entity of the always-running black-hole rumble loop (volume rides dread).
+#[derive(Resource)]
+struct DreadLoop(Entity);
 
 // ---------------------------------------------------------------------------
 // Synthesis primitives
@@ -273,6 +289,55 @@ fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
         lp3 * (1.0 - expd(t, 0.02)) * expd(t, 0.35)
     });
 
+    // Black-hole rumble: lowpassed brown noise + a 26Hz throb breathing on a
+    // slow LFO. Loops over 8s (all components integer-cycle); volume rides
+    // the dread level so it creeps in as the day runs out.
+    let mut brown2 = 0.0f32;
+    let mut lp4 = 0.0f32;
+    let dread_loop = loopify(
+        render(8.0, |t, i| {
+            brown2 = (brown2 + 0.10 * noise(i)) * 0.997;
+            lp4 += 0.06 * (brown2 - lp4);
+            let breathe = 0.65 + 0.35 * (TAU * t / 8.0).sin();
+            lp4 * 5.0 * breathe
+                + 0.45 * (TAU * 26.0 * t).sin() * breathe
+                + 0.18 * (TAU * 39.0 * t).sin() * (0.5 + 0.5 * (TAU * 2.0 * t / 8.0).sin())
+        }),
+        4096,
+    );
+
+    // Collapse: a 3s dread riser — pitch and density climbing into the boom.
+    let mut lp5 = 0.0f32;
+    let collapse = render(3.0, |t, i| {
+        let k = t / 3.0;
+        let f = 55.0 * (9.0f32).powf(k);
+        lp5 += (0.05 + 0.4 * k) * (noise(i) - lp5);
+        (TAU * f * t).sin() * (0.25 + 0.75 * k)
+            + 0.5 * (TAU * f * 1.5 * t).sin() * k * k
+            + lp5 * (0.8 + 2.0 * k)
+    });
+
+    // Consumed: crossing the horizon. Sub annihilation + a long white wash.
+    let mut brown3 = 0.0f32;
+    let consumed = render(2.4, |t, i| {
+        brown3 = (brown3 + 0.14 * noise(i)) * 0.997;
+        0.9 * (TAU * 30.0 * (1.0 - t * 0.18) * t).sin() * (-t * 1.3).exp()
+            + brown3 * 7.0 * (-t * 1.8).exp()
+            + noise(i) * expd(t, 0.05) * 0.6
+    });
+
+    // Dawn: three soft warm tones blooming out of silence.
+    let dawn = render(1.6, |t, _| {
+        let note = |f: f32, at: f32| {
+            if t < at {
+                0.0
+            } else {
+                (TAU * f * (t - at)).sin() * (1.0 - expd(t - at, 0.04)) * expd(t - at, 0.45)
+            }
+        };
+        note(392.0, 0.0) + 0.8 * note(523.25, 0.25) + 0.7 * note(659.25, 0.5)
+    });
+
     commands.insert_resource(Sfx {
         laser_loop: audio.add(wav(laser_loop, 0.8)),
         jet_loop: audio.add(wav(jet_loop, 0.8)),
@@ -289,6 +354,9 @@ fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
         warp_down: audio.add(wav(warp_down, 0.8)),
         overheat: audio.add(wav(overheat, 0.8)),
         vent: audio.add(wav(vent, 0.8)),
+        collapse: audio.add(wav(collapse, 0.9)),
+        consumed: audio.add(wav(consumed, 0.95)),
+        dawn: audio.add(wav(dawn, 0.8)),
     });
 
     // The void hum starts immediately and never stops.
@@ -297,6 +365,16 @@ fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
         AudioPlayer::new(drone),
         PlaybackSettings::LOOP.with_volume(Volume::Linear(0.16)),
     ));
+
+    // The black hole's rumble also never stops — it just starts inaudible.
+    let dread = audio.add(wav(dread_loop, 0.85));
+    let e = commands
+        .spawn((
+            AudioPlayer::new(dread),
+            PlaybackSettings::LOOP.with_volume(Volume::Linear(0.0)),
+        ))
+        .id();
+    commands.insert_resource(DreadLoop(e));
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +400,9 @@ fn play_queued(mut queue: ResMut<SfxQueue>, sfx: Res<Sfx>, mut commands: Command
             SfxEvent::WarpDown => (&sfx.warp_down, 0.5, 1.0),
             SfxEvent::Overheat => (&sfx.overheat, 0.5, 1.0),
             SfxEvent::Vent => (&sfx.vent, 0.5, 1.0),
+            SfxEvent::Collapse => (&sfx.collapse, 0.85, 1.0),
+            SfxEvent::Consumed => (&sfx.consumed, 0.95, 1.0),
+            SfxEvent::Dawn => (&sfx.dawn, 0.55, 1.0),
         };
         commands.spawn((
             AudioPlayer::new(handle.clone()),
@@ -362,6 +443,21 @@ fn laser_loop_ctl(
             *handle = None;
         }
         (None, false) => {}
+    }
+}
+
+/// The rumble loop's volume and pitch ride the published dread level —
+/// silence at dawn, chest-cavity throb at the horizon.
+fn dread_loop_ctl(
+    bh: Res<crate::blackhole::BlackHole>,
+    handle: Option<Res<DreadLoop>>,
+    mut sinks: Query<&mut AudioSink>,
+) {
+    let Some(handle) = handle else { return };
+    if let Ok(mut sink) = sinks.get_mut(handle.0) {
+        let d = bh.dread.clamp(0.0, 1.0);
+        sink.set_volume(Volume::Linear(0.65 * d * d));
+        sink.set_speed(0.9 + 0.35 * d);
     }
 }
 

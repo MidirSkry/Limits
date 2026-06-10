@@ -36,7 +36,7 @@ impl Plugin for DemoPlugin {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct DemoState {
-    target: Option<(Vec3, f32)>, // neighbor asteroid (center, reach)
+    target: Option<crate::world::Asteroid>,
     arrived_at: Option<f32>,
     bombed_at: Option<f32>,
     heading_home_at: Option<f32>,
@@ -75,6 +75,7 @@ fn run_demo(
     time: Res<Time>,
     mut focused: ResMut<Focused>,
     mut player: ResMut<PlayerState>,
+    bh: Res<crate::blackhole::BlackHole>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut mouse: ResMut<ButtonInput<MouseButton>>,
     mut state: Local<DemoState>,
@@ -87,7 +88,7 @@ fn run_demo(
     // Pick the flight target once: the nearest non-home asteroid.
     if state.target.is_none() {
         if let Some(a) = crate::world::nearest_asteroid(player.pos, true) {
-            state.target = Some((a.center, a.reach()));
+            state.target = Some(a);
             eprintln!(
                 "[demo] target asteroid at ({:.0},{:.0},{:.0}) r~{:.0} dist {:.0}m",
                 a.center.x,
@@ -98,9 +99,20 @@ fn run_demo(
             );
         }
     }
-    let (target_c, target_r) = state.target.unwrap_or((Vec3::new(60.0, 0.0, 60.0), 8.0));
+    let (target_c, target_dist) = match &state.target {
+        Some(a) => {
+            let to = a.center - player.eye();
+            // True surface distance along our approach — asteroids are lumpy
+            // ellipsoids now, so reach() can overshoot the real ground by
+            // 10m+ and strand the tour hovering in vacuum.
+            (a.center, to.length() - a.surface_toward(player.eye()))
+        }
+        None => {
+            let c = Vec3::new(60.0, 0.0, 60.0);
+            (c, (c - player.eye()).length() - 8.0)
+        }
+    };
     let to_target = target_c - player.eye();
-    let target_dist = to_target.length() - target_r; // to the surface-ish
     let to_shop = shop_pos() + Vec3::Y * 1.0 - player.pos;
     let shop_dist = Vec2::new(to_shop.x, to_shop.z).length();
 
@@ -108,7 +120,8 @@ fn run_demo(
     let (yaw_t, pitch_t) = if t < 3.0 {
         (t * 0.55, 0.10) // sky pan
     } else if t < 5.0 {
-        (0.64, 0.18) // gas giant
+        // Stare into the black hole — the money shot.
+        aim((bh.center - player.eye()).normalize_or_zero())
     } else if t < 11.0 {
         (0.64, -0.95) // mine the ground (long enough to overheat)
     } else if state.bombed_at.is_none() || state.heading_home_at.is_none() {
@@ -211,7 +224,7 @@ fn run_demo(
     // Shot in declared order: the next one fires when its condition is true.
     let conds: [(bool, &'static str); 8] = [
         (t >= 2.2, "shots/01-sky.png"),
-        (t >= 4.5, "shots/02-planet.png"),
+        (t >= 4.5, "shots/02-blackhole.png"),
         (t >= 6.5, "shots/03-laser.png"),
         (t >= 10.4, "shots/04-overheat.png"),
         (t >= 14.5, "shots/05-flight.png"),

@@ -10,7 +10,7 @@ use crate::audio::{SfxEvent, SfxQueue};
 use crate::game::Upgrades;
 use crate::items::{self, ItemAssets};
 use crate::world::{
-    self, block_display_name, block_hp, raycast, tier_of_voxel, VoxelWorld, AIR, BARRIER, ORE,
+    self, block_display_name, block_hp, raycast, voxel_env, VoxelWorld, AIR, BARRIER, ORE,
     REGOLITH, VOXEL,
 };
 
@@ -254,7 +254,10 @@ fn setup_player(
             Camera3d::default(),
             Projection::Perspective(PerspectiveProjection {
                 fov: 1.22, // ~70°
-                far: 2500.0, // the sky furniture lives way out there
+                // The black hole is a REAL object out to ~8.5km (center +
+                // accretion disc), not sky furniture — the far plane must
+                // cover it everywhere in the play field.
+                far: 14_000.0,
                 ..default()
             }),
             Transform::from_translation(PlayerState::spawn_point() + Vec3::Y * EYE),
@@ -763,7 +766,7 @@ fn mining(
     laser.has_hit = true;
     laser.beam_end = eye + dir * (hit.t - 0.01).max(0.1);
 
-    let tier = tier_of_voxel(v);
+    let (tier, species) = voxel_env(v);
     let hp_max = block_hp(id, tier);
     let is_ore = id == ORE;
     let value = if is_ore { world::ore_value(tier) } else { 0 };
@@ -834,7 +837,7 @@ fn mining(
     }
 
     target.0 = Some(TargetBlock {
-        name: block_display_name(id, tier),
+        name: block_display_name(id, tier, species),
         hp_frac: if hp_max.is_finite() {
             (remaining / hp_max).clamp(0.0, 1.0)
         } else {

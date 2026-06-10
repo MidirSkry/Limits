@@ -384,11 +384,13 @@ fn shop_system(
 fn teleport_system(
     keys: Res<ButtonInput<KeyCode>>,
     upgrades: Res<Upgrades>,
+    day: Res<crate::blackhole::DayState>,
     mut player: ResMut<PlayerState>,
     mut status: ResMut<StatusMsg>,
     mut sfx: ResMut<SfxQueue>,
 ) {
-    if !upgrades.recall {
+    // No warping out of the event horizon's grip — the dive is final.
+    if !upgrades.recall || day.phase != crate::blackhole::DayPhase::Active {
         return;
     }
     if keys.just_pressed(KeyCode::KeyT) {

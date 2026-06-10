@@ -34,16 +34,23 @@ const CHUNK_M: f32 = CHUNK as f32 * VOXEL; // 4m
 
 /// Asteroid field: one cell of space may hold one asteroid.
 pub const CELL_M: f32 = 56.0;
-/// Chance a cell hosts an asteroid. Tuned with the impostor LOD in view:
-/// dense enough that a neighbor is always a short flight away, sparse enough
-/// that the sky reads as a field, not foam.
-const CELL_DENSITY: f32 = 0.20;
+/// Chance a cell hosts an asteroid. Deliberately sparse — the black hole is
+/// the landmark now, and each rock should feel like a destination. A starter
+/// rock is guaranteed within a couple of cells of home (see `starter_cell`).
+const CELL_DENSITY: f32 = 0.035;
 /// Asteroid radii (pre-displacement), small ones common, big ones rare.
-const R_MIN: f32 = 5.0;
-const R_MAX: f32 = 17.0;
-/// Radial displacement: surface = r * (BASE + AMP * fbm(dir)).
-const DISP_BASE: f32 = 0.84;
-const DISP_AMP: f32 = 0.16;
+/// Rarer field = bigger rocks, so a find is worth the flight.
+const R_MIN: f32 = 6.0;
+const R_MAX: f32 = 22.0;
+/// Per-asteroid shape ranges (derived from the seed): ellipsoid stretch per
+/// axis, displacement amplitude, and noise frequency. `reach()` and the
+/// overlap pad must bound the extremes.
+const STRETCH_MIN: f32 = 0.78;
+const STRETCH_MAX: f32 = 1.40;
+const AMP_MIN: f32 = 0.10;
+const AMP_MAX: f32 = 0.30;
+const FREQ_MIN: f32 = 1.6;
+const FREQ_MAX: f32 = 3.2;
 /// The home rock.
 pub const HOME_R: f32 = 15.0;
 /// Distance from home per difficulty tier ("sector").
@@ -77,6 +84,9 @@ pub const REGOLITH: u8 = 2;
 pub const ROCK: u8 = 3;
 pub const ORE: u8 = 4;
 
+// Rock identity is a per-asteroid SPECIES (from its seed) — fly past a grey
+// chondrite ball, an icy blue shard, a rust-red ellipsoid. Ore identity stays
+// tier-based so the progression ladder still reads.
 const ROCK_NAMES: [&str; 8] = [
     "Chondrite", "Basalt", "Magnetite", "Hematite", "Pallasite", "Obsidian", "Deepcore",
     "Voidrock",
@@ -85,17 +95,18 @@ const ORE_NAMES: [&str; 8] = [
     "Carbon", "Ferrite", "Cobalt", "Titania", "Argent", "Aurium", "Cryonite", "Stellarite",
 ];
 
-// Linear-RGB palettes, cycled per tier. Vertex colors multiply the material's
-// white base color, so these are the on-screen block colors.
+// Linear-RGB palettes. ROCK_COLORS indexes by asteroid species; ORE_COLORS by
+// tier. Vertex colors multiply the material's white base color, so these are
+// the on-screen block colors.
 const ROCK_COLORS: [[f32; 3]; 8] = [
-    [0.38, 0.36, 0.34], // Chondrite — dusty grey-brown
-    [0.26, 0.26, 0.29], // Basalt — dark blue-grey
-    [0.33, 0.30, 0.36], // Magnetite — purple-grey
-    [0.42, 0.30, 0.26], // Hematite — rust
-    [0.45, 0.42, 0.34], // Pallasite — olive metal
-    [0.12, 0.10, 0.16], // Obsidian — near-black violet
-    [0.18, 0.24, 0.28], // Deepcore — cold teal-grey
-    [0.28, 0.13, 0.28], // Voidrock — bruised purple
+    [0.40, 0.37, 0.33], // Chondrite — dusty grey-brown
+    [0.22, 0.24, 0.30], // Basalt — dark blue-grey
+    [0.36, 0.29, 0.44], // Magnetite — violet sheen
+    [0.52, 0.26, 0.17], // Hematite — rust red
+    [0.42, 0.45, 0.28], // Pallasite — olive metal
+    [0.13, 0.11, 0.17], // Obsidian — near-black violet
+    [0.30, 0.46, 0.50], // Deepcore — glacial blue-teal
+    [0.38, 0.16, 0.36], // Voidrock — bruised purple
 ];
 const ORE_COLORS: [[f32; 3]; 8] = [
     [0.55, 0.48, 0.34], // Carbon — warm amber glint
@@ -139,15 +150,14 @@ pub fn ore_name(tier: i32) -> String {
     format!("{}{}", ORE_NAMES[(tier % n) as usize], tier_suffix(tier / n))
 }
 
-pub fn rock_name(tier: i32) -> String {
-    let n = ROCK_NAMES.len() as i32;
-    format!("{}{}", ROCK_NAMES[(tier % n) as usize], tier_suffix(tier / n))
+pub fn rock_name(species: u8) -> String {
+    ROCK_NAMES[(species as usize) % ROCK_NAMES.len()].to_string()
 }
 
-pub fn block_display_name(id: u8, tier: i32) -> String {
+pub fn block_display_name(id: u8, tier: i32, species: u8) -> String {
     match id {
         REGOLITH => "Regolith".to_string(),
-        ROCK => rock_name(tier),
+        ROCK => rock_name(species),
         ORE => format!("{} Crystal", ore_name(tier)),
         BARRIER => "Dense Core".to_string(),
         _ => String::new(),
@@ -169,10 +179,11 @@ pub fn loot_value(id: u8, tier: i32) -> u64 {
     }
 }
 
+#[allow(dead_code)] // save-file / tooltip use; keep aligned with loot_value
 pub fn loot_name(id: u8, tier: i32) -> String {
     match id {
         REGOLITH => "Regolith".to_string(),
-        ROCK => rock_name(tier),
+        ROCK => rock_name((tier % ROCK_NAMES.len() as i32) as u8),
         ORE => ore_name(tier),
         _ => String::new(),
     }
@@ -187,6 +198,29 @@ pub fn loot_color(id: u8, tier: i32) -> [f32; 3] {
         ORE => ORE_COLORS[t % ORE_COLORS.len()],
         _ => [1.0, 0.0, 1.0],
     }
+}
+
+// ---------------------------------------------------------------------------
+// World salt — the only mutable input to worldgen. Each black-hole "day"
+// reseeds the asteroid field (home rock excepted) so every run is a fresh
+// claim. Everything else stays a pure function of (coords, salt).
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static WORLD_SALT: AtomicU64 = AtomicU64::new(0);
+
+/// NOTE: process-global. Unit tests share one process and run in parallel, so
+/// tests must never call this — they all assume salt 0.
+pub fn set_world_salt(salt: u64) {
+    WORLD_SALT.store(salt, Ordering::Relaxed);
+}
+
+#[inline]
+fn salted(salt: u64) -> u64 {
+    salt ^ WORLD_SALT
+        .load(Ordering::Relaxed)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 // ---------------------------------------------------------------------------
@@ -255,27 +289,63 @@ pub struct Asteroid {
     pub seed: u64,
     /// Difficulty tier from distance to home.
     pub tier: i32,
+    /// Visual identity: ROCK_COLORS / ROCK_NAMES row.
+    pub species: u8,
+    /// Ellipsoid stretch per axis — potatoes, shards, and near-spheres.
+    pub stretch: Vec3,
+    /// Displacement amplitude and noise frequency — smooth blob vs crag.
+    pub amp: f32,
+    pub freq: f32,
+}
+
+/// Per-seed scalar in [0,1) for shape parameters.
+#[inline]
+fn seed_unit(seed: u64, k: u64) -> f32 {
+    let mut x = seed ^ k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((x >> 40) as f32) / ((1u64 << 24) as f32)
 }
 
 impl Asteroid {
+    fn shaped(center: Vec3, radius: f32, seed: u64, tier: i32) -> Self {
+        let u = |k: u64| seed_unit(seed, k);
+        Self {
+            center,
+            radius,
+            seed,
+            tier,
+            species: ((seed >> 17) % ROCK_COLORS.len() as u64) as u8,
+            stretch: Vec3::new(
+                STRETCH_MIN + (STRETCH_MAX - STRETCH_MIN) * u(1),
+                STRETCH_MIN + (STRETCH_MAX - STRETCH_MIN) * u(2),
+                STRETCH_MIN + (STRETCH_MAX - STRETCH_MIN) * u(3),
+            ),
+            amp: AMP_MIN + (AMP_MAX - AMP_MIN) * u(4),
+            freq: FREQ_MIN + (FREQ_MAX - FREQ_MIN) * u(5),
+        }
+    }
+
     /// Conservative outer bound of the displaced surface.
     pub fn reach(&self) -> f32 {
-        self.radius * (DISP_BASE + DISP_AMP)
+        self.radius * self.stretch.max_element() * (0.95 + self.amp)
     }
 
     /// Displaced surface radius along the direction of `p`. Public so the
     /// impostor LOD can build silhouette-matched far meshes from the same
-    /// noise.
+    /// noise. Base shape is an ellipsoid (per-axis stretch), displaced by
+    /// per-asteroid fbm.
     pub fn surface_toward(&self, p: Vec3) -> f32 {
         let dir = (p - self.center).normalize_or_zero();
+        let e = dir / self.stretch;
+        let base = self.radius / e.length().max(1e-4);
         let s = Vec3::new(
             (self.seed & 0xFFFF) as f32,
             ((self.seed >> 16) & 0xFFFF) as f32,
             ((self.seed >> 32) & 0xFFFF) as f32,
         ) * 0.001;
-        self.radius * (DISP_BASE + DISP_AMP * fbm(dir * 2.0 + s, 3, self.seed))
+        base * ((0.95 - self.amp) + 2.0 * self.amp * fbm(dir * self.freq + s, 3, self.seed))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -379,38 +449,65 @@ fn cell_of(p: Vec3) -> IVec3 {
     (p / CELL_M).floor().as_ivec3()
 }
 
-/// The asteroid hosted by a field cell, if any. Pure function of the cell.
+/// The cell guaranteed to host a starter rock near home — the field is sparse
+/// now, so without this an unlucky day could strand a fresh claim. Direction
+/// varies with the world salt; always within 2 cells (~120m, tier 0/1).
+fn starter_cell() -> IVec3 {
+    let s = WORLD_SALT.load(Ordering::Relaxed);
+    let pick = |k: u64| {
+        // One of {-2, -1, 1, 2} — never 0, so it can't collide with home.
+        let u = seed_unit(s.wrapping_add(0xB00B5), k);
+        let v = (u * 4.0) as i32 - 2;
+        if v >= 0 { v + 1 } else { v }
+    };
+    IVec3::new(pick(11), pick(22), pick(33))
+}
+
+/// The asteroid hosted by a field cell, if any. Pure function of the cell
+/// and the world salt.
 pub fn asteroid_in_cell(c: IVec3) -> Option<Asteroid> {
-    // The home rock owns the origin cell.
+    // The home rock owns the origin cell — fixed across days so the depot
+    // never moves.
     if c == IVec3::ZERO {
         return Some(Asteroid {
             center: Vec3::ZERO,
             radius: HOME_R,
             seed: 0xCAFE_D00D,
             tier: 0,
+            species: 0,
+            stretch: Vec3::ONE,
+            amp: 0.16,
+            freq: 2.0,
         });
     }
-    if hash_unit(c, 0xF1E1D) > CELL_DENSITY {
+    let starter = c == starter_cell();
+    if !starter && hash_unit(c, salted(0xF1E1D)) > CELL_DENSITY {
         return None;
     }
-    let j = |salt: u64| 0.25 + 0.5 * hash_unit(c, salt);
+    let j = |salt: u64| 0.25 + 0.5 * hash_unit(c, salted(salt));
     let center = (c.as_vec3() + Vec3::new(j(0xA1), j(0xA2), j(0xA3))) * CELL_M;
-    let radius = R_MIN + hash_unit(c, 0xA4).powi(2) * (R_MAX - R_MIN);
+    let radius = if starter {
+        // A respectable first target, never a pebble.
+        R_MIN + 4.0 + hash_unit(c, salted(0xA4)) * 6.0
+    } else {
+        R_MIN + hash_unit(c, salted(0xA4)).powi(2) * (R_MAX - R_MIN)
+    };
     // Keep a clear corridor around the home rock.
-    if center.length() < HOME_R + radius + 10.0 {
+    if !starter && center.length() < HOME_R + radius + 10.0 {
         return None;
     }
-    Some(Asteroid {
+    Some(Asteroid::shaped(
         center,
         radius,
-        seed: hash3(c, 0xA5),
-        tier: (center.length() / TIER_M) as i32,
-    })
+        hash3(c, salted(0xA5)),
+        // The starter rock is always tier 0 — it's the tutorial target.
+        if starter { 0 } else { (center.length() / TIER_M) as i32 },
+    ))
 }
 
 /// All asteroids whose displaced surface could intersect the AABB (meters).
 pub fn asteroids_overlapping(min_m: Vec3, max_m: Vec3) -> Vec<Asteroid> {
-    let pad = R_MAX * (DISP_BASE + DISP_AMP) + 0.5;
+    let pad = R_MAX * STRETCH_MAX * (0.95 + AMP_MAX) + 0.5;
     let lo = cell_of(min_m - Vec3::splat(pad));
     let hi = cell_of(max_m + Vec3::splat(pad));
     let mut out = Vec::new();
@@ -473,8 +570,9 @@ pub fn block_at(v: IVec3) -> u8 {
     AIR
 }
 
-/// Tier of the asteroid covering this voxel (distance tier in open space).
-pub fn tier_of_voxel(v: IVec3) -> i32 {
+/// (tier, species) of the asteroid covering this voxel — distance tier and
+/// default species in open space.
+pub fn voxel_env(v: IVec3) -> (i32, u8) {
     let p = voxel_center_m(v);
     asteroids_overlapping(p, p)
         .iter()
@@ -482,7 +580,12 @@ pub fn tier_of_voxel(v: IVec3) -> i32 {
             p.distance_squared(a.center) <= a.reach() * a.reach()
                 && field_single(a, p) > 0.0
         })
-        .map_or_else(|| (p.length() / TIER_M) as i32, |a| a.tier)
+        .map_or_else(|| ((p.length() / TIER_M) as i32, 0), |a| (a.tier, a.species))
+}
+
+/// Tier of the asteroid covering this voxel (distance tier in open space).
+pub fn tier_of_voxel(v: IVec3) -> i32 {
+    voxel_env(v).0
 }
 
 /// Where the player materializes: on top of the home rock.
@@ -493,7 +596,8 @@ pub fn home_spawn() -> Vec3 {
 
 /// Y (meters) of the first open voxel above the home rock at (x, z).
 pub fn surface_y_at(x_m: f32, z_m: f32) -> f32 {
-    let top = (HOME_R * (DISP_BASE + DISP_AMP) / VOXEL).ceil() as i32 + 2;
+    // Home rock shape: stretch 1, amp 0.16 — bound is r * (0.95 + amp).
+    let top = (HOME_R * (0.95 + 0.16) / VOXEL).ceil() as i32 + 2;
     let (vx, vz) = ((x_m / VOXEL).floor() as i32, (z_m / VOXEL).floor() as i32);
     for vy in (-top..=top).rev() {
         if block_at(IVec3::new(vx, vy, vz)) != AIR {
@@ -503,11 +607,12 @@ pub fn surface_y_at(x_m: f32, z_m: f32) -> f32 {
     0.0
 }
 
-/// Far-LOD impostor vertex color: the tier's rock tone washed toward
+/// Far-LOD impostor vertex color: the species' rock tone washed toward
 /// regolith grey (what a voxel asteroid averages to at distance), jittered.
-pub fn impostor_color(tier: i32, jitter01: f32) -> [f32; 3] {
-    let rock = ROCK_COLORS[(tier.max(0) as usize) % ROCK_COLORS.len()];
-    let j = (0.72 + 0.25 * jitter01) * 0.9;
+pub fn impostor_color(species: u8, jitter01: f32) -> [f32; 3] {
+    let rock = ROCK_COLORS[(species as usize) % ROCK_COLORS.len()];
+    // Dimmer than face value: a sunlit pastel ball reads as candy, not rock.
+    let j = (0.58 + 0.30 * jitter01) * 0.85;
     [
         (rock[0] * 0.6 + 0.24 * 0.4) * j,
         (rock[1] * 0.6 + 0.22 * 0.4) * j,
@@ -516,18 +621,27 @@ pub fn impostor_color(tier: i32, jitter01: f32) -> [f32; 3] {
 }
 
 /// Per-vertex linear color for a block, with a little per-voxel brightness
-/// jitter so untextured cubes don't read as a flat wall of one color.
-fn block_color(id: u8, tier: i32, v: IVec3, shell: bool) -> [f32; 3] {
+/// jitter so untextured cubes don't read as a flat wall of one color. Rock
+/// body color follows the asteroid's species; ore follows the tier; the
+/// regolith shell takes a faint species tint so surfaces differ too.
+fn block_color(id: u8, tier: i32, species: u8, v: IVec3, shell: bool) -> [f32; 3] {
     let t = tier.max(0) as usize;
+    let s = species as usize % ROCK_COLORS.len();
     let base = match id {
         REGOLITH => {
-            if shell {
+            let rock = ROCK_COLORS[s];
+            let grey = if shell {
                 [0.34, 0.325, 0.30]
             } else {
                 [0.30, 0.275, 0.25]
-            }
+            };
+            [
+                grey[0] * 0.75 + rock[0] * 0.25,
+                grey[1] * 0.75 + rock[1] * 0.25,
+                grey[2] * 0.75 + rock[2] * 0.25,
+            ]
         }
-        ROCK => ROCK_COLORS[t % ROCK_COLORS.len()],
+        ROCK => ROCK_COLORS[s],
         ORE => ORE_COLORS[t % ORE_COLORS.len()],
         BARRIER => [0.09, 0.10, 0.12],
         _ => [1.0, 0.0, 1.0],
@@ -673,6 +787,18 @@ impl VoxelWorld {
     pub fn forget_empty(&mut self, keep_near: IVec3, radius: i32) {
         self.empty
             .retain(|cp| (*cp - keep_near).abs().max_element() <= radius);
+    }
+
+    /// Day reset: drop ALL storage, edits, and damage, and reseed worldgen.
+    /// Chunks restream around the player on the following frames; the home
+    /// rock regenerates pristine.
+    pub fn reset_for_new_day(&mut self, salt: u64) {
+        set_world_salt(salt);
+        self.chunks.clear();
+        self.empty.clear();
+        self.dirty.clear();
+        self.damage.clear();
+        self.edits.clear();
     }
 
     /// Remove a block (mined out). Records the edit and marks the chunk — and
@@ -894,17 +1020,17 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
             (a, g)
         })
         .collect();
-    let tier_at = |p: Vec3| -> (i32, bool) {
+    let tier_at = |p: Vec3| -> (i32, u8, bool) {
         for (a, grid) in &grids {
             if p.distance_squared(a.center) > a.reach() * a.reach() {
                 continue;
             }
             let f = grid.sample(p);
             if f > 0.0 {
-                return (a.tier, f < SHELL_M);
+                return (a.tier, a.species, f < SHELL_M);
             }
         }
-        (0, false)
+        (0, 0, false)
     };
 
     let origin = cp * CHUNK;
@@ -916,8 +1042,8 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
                 if id == AIR {
                     continue;
                 }
-                let (tier, shell) = tier_at(voxel_center_m(v));
-                let col = block_color(id, tier, v, shell);
+                let (tier, species, shell) = tier_at(voxel_center_m(v));
+                let col = block_color(id, tier, species, v, shell);
                 let base = (v.as_vec3()) * VOXEL;
                 for face in &FACES {
                     if world.solid(v + face.dir) {
@@ -952,6 +1078,17 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
 /// Solid + glow mesh entities for each materialized chunk.
 #[derive(Resource, Default)]
 pub struct ChunkEntities(HashMap<IVec3, (Entity, Entity)>);
+
+impl ChunkEntities {
+    /// Day reset: despawn every chunk mesh entity. Pairs with
+    /// `VoxelWorld::reset_for_new_day`.
+    pub fn despawn_all(&mut self, commands: &mut Commands) {
+        for (_, (a, b)) in self.0.drain() {
+            commands.entity(a).despawn();
+            commands.entity(b).despawn();
+        }
+    }
+}
 
 #[derive(Resource)]
 pub struct WorldAssets {
@@ -1166,13 +1303,56 @@ mod tests {
 
     #[test]
     fn field_has_neighbors_with_distance_tiers() {
-        // Some asteroid must exist within a few cells of home...
+        // The starter guarantee: an asteroid within 2 cells of home, easy tier.
         let near = nearest_asteroid(Vec3::ZERO, true).expect("field should not be empty");
         assert!(near.center.length() > HOME_R);
-        // ...and tiers grow with distance.
-        let far_tier = ((5.0 * CELL_M) / TIER_M) as i32;
-        assert!(far_tier >= 1);
-        assert_eq!(near.tier, (near.center.length() / TIER_M) as i32);
+        assert!(near.center.length() < 3.0 * CELL_M * 1.8);
+        assert!(near.tier <= 1);
+        // Ordinary (non-starter) asteroids take their tier from distance.
+        let mut checked = false;
+        'outer: for cz in -6..=6 {
+            for cy in -6..=6 {
+                for cx in -6..=6 {
+                    let c = IVec3::new(cx, cy, cz);
+                    if c == IVec3::ZERO || c == starter_cell() {
+                        continue;
+                    }
+                    if let Some(a) = asteroid_in_cell(c) {
+                        assert_eq!(a.tier, (a.center.length() / TIER_M) as i32);
+                        checked = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert!(checked, "expected at least one ordinary asteroid within 6 cells");
+    }
+
+    #[test]
+    fn asteroids_have_shape_and_species_variety() {
+        // Scan a swath of cells; the field should not be all one species or
+        // one shape.
+        let mut species = std::collections::HashSet::new();
+        let mut min_amp = f32::MAX;
+        let mut max_amp = f32::MIN;
+        for cz in -14..=14 {
+            for cy in -3..=3 {
+                for cx in -14..=14 {
+                    if let Some(a) = asteroid_in_cell(IVec3::new(cx, cy, cz)) {
+                        species.insert(a.species);
+                        min_amp = min_amp.min(a.amp);
+                        max_amp = max_amp.max(a.amp);
+                        // Shape params stay inside their declared bounds
+                        // (reach() and the overlap pad depend on it).
+                        assert!(a.stretch.max_element() <= STRETCH_MAX + 1e-4);
+                        assert!(a.stretch.min_element() >= STRETCH_MIN - 1e-4);
+                        assert!(a.amp <= AMP_MAX + 1e-4 && a.amp >= AMP_MIN - 1e-4);
+                    }
+                }
+            }
+        }
+        assert!(species.len() >= 4, "want species variety, got {species:?}");
+        assert!(max_amp - min_amp > 0.05, "want shape variety");
     }
 
     #[test]

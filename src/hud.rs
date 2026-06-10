@@ -10,6 +10,7 @@ use bevy::image::{Image, ImageSampler};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
+use crate::blackhole::{BlackHole, DayPhase, DayState};
 use crate::game::{shop_pos, Inventory, NearShop, StatusMsg, Upgrades, Wallet, RECALL_COST};
 use crate::player::{Focused, LaserState, PlayerState, TargetInfo};
 use crate::world::{loot_color, TIER_M};
@@ -164,6 +165,20 @@ const ICON_ORB: Glyph = [
     "............",
     "............",
 ];
+const ICON_HOLE: Glyph = [
+    "............",
+    "....####....",
+    "..##....##..",
+    ".#..####..#.",
+    ".#.######.#.",
+    "#..######..#",
+    "#..######..#",
+    ".#.######.#.",
+    ".#..####..#.",
+    "..##....##..",
+    "....####....",
+    "............",
+];
 const ICON_FLAG: Glyph = [
     "..#.........",
     "..########..",
@@ -225,6 +240,7 @@ struct Icons {
     beacon: Handle<Image>,
     orb: Handle<Image>,
     flag: Handle<Image>,
+    hole: Handle<Image>,
 }
 
 /// An icon as a UI node, tinted.
@@ -304,6 +320,24 @@ struct ControlsText;
 struct NavMarker;
 #[derive(Component)]
 struct NavDistText;
+/// Doom gauge: day number + event-horizon proximity bar + countdown.
+#[derive(Component)]
+struct DayNumText;
+#[derive(Component)]
+struct DoomBarFill;
+#[derive(Component)]
+struct DoomCountText;
+/// Red edge vignette that breathes as the dread level climbs.
+#[derive(Component)]
+struct DangerVignette;
+/// Full-screen white flash for the horizon crossing + dawn fade.
+#[derive(Component)]
+struct Whiteout;
+/// "DAY N" ceremony during the dawn fade.
+#[derive(Component)]
+struct DaySplash;
+#[derive(Component)]
+struct DaySplashText;
 
 /// World-anchored floating text. Lives on a UI Text node; the animate system
 /// projects `world_pos` to the screen each frame and fades it out.
@@ -330,6 +364,8 @@ impl Plugin for HudPlugin {
                 hud_status,
                 hud_controls,
                 hud_nav_marker,
+                hud_doom,
+                hud_dread_fx,
                 animate_float_text,
             ),
         );
@@ -371,6 +407,7 @@ fn setup_hud(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         beacon: bake_icon(&mut images, ICON_BEACON),
         orb: bake_icon(&mut images, ICON_ORB),
         flag: bake_icon(&mut images, ICON_FLAG),
+        hole: bake_icon(&mut images, ICON_HOLE),
     };
 
     // --- Credits chip (top-left) ---------------------------------------------
@@ -436,6 +473,112 @@ fn setup_hud(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
                     b.spawn((Text::new("I"), font(12.0), TextColor(CYAN), SectorText));
                 });
             });
+        });
+
+    // --- Doom gauge (top-center, under the range chip): day pip + horizon
+    // proximity bar + countdown. THE clock that rules the run. -----------------
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(52.0),
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                chip_node(),
+                BackgroundColor(PANEL_BG),
+                BorderColor::all(Color::srgba(0.85, 0.45, 0.30, 0.45)),
+            ))
+            .with_children(|c| {
+                c.spawn(icon(&icons.hole, 15.0, Color::srgb(1.0, 0.65, 0.40)));
+                c.spawn((
+                    Text::new("1"),
+                    font(15.0),
+                    TextColor(Color::srgb(1.0, 0.75, 0.55)),
+                    DayNumText,
+                ));
+                c.spawn((
+                    Node {
+                        width: Val::Px(150.0),
+                        height: Val::Px(7.0),
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(BAR_BG),
+                    BorderColor::all(Color::srgba(0.0, 0.0, 0.0, 0.6)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        Node {
+                            width: Val::Percent(0.0),
+                            height: Val::Percent(100.0),
+                            border_radius: BorderRadius::all(Val::Px(2.0)),
+                            ..default()
+                        },
+                        BackgroundColor(CYAN),
+                        DoomBarFill,
+                    ));
+                });
+                c.spawn((
+                    Text::new(""),
+                    font(14.0),
+                    TextColor(TEXT_DIM),
+                    DoomCountText,
+                ));
+            });
+        });
+
+    // --- Danger vignette: a red border that breathes with the dread level ----
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            border: UiRect::all(Val::Px(7.0)),
+            ..default()
+        },
+        BorderColor::all(Color::NONE),
+        GlobalZIndex(50),
+        DangerVignette,
+    ));
+
+    // --- Whiteout flash + day splash (topmost) --------------------------------
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            ..default()
+        },
+        BackgroundColor(Color::NONE),
+        GlobalZIndex(100),
+        Whiteout,
+    ));
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                top: Val::Percent(34.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(8.0),
+                ..default()
+            },
+            Visibility::Hidden,
+            GlobalZIndex(101),
+            DaySplash,
+        ))
+        .with_children(|s| {
+            s.spawn((
+                Text::new("DAY 1"),
+                font(64.0),
+                TextColor(Color::srgb(0.10, 0.16, 0.22)),
+                DaySplashText,
+            ));
         });
 
     // --- Speed chip (top-right) ------------------------------------------------
@@ -1133,6 +1276,91 @@ fn hud_shop(
     for (pt, mut text, mut color) in &mut pill_texts {
         text.0 = rows[pt.0].2.clone();
         color.0 = if rows[pt.0].3 { AFFORD } else { TOO_RICH };
+    }
+}
+
+/// The doom gauge: day number, horizon-proximity bar, countdown. The bar is
+/// the day fraction; its color walks cyan → gold → red and pulses near the
+/// end.
+#[allow(clippy::type_complexity)]
+fn hud_doom(
+    time: Res<Time>,
+    day: Res<DayState>,
+    mut q: ParamSet<(
+        Query<&mut Text, With<DayNumText>>,
+        Query<(&mut Node, &mut BackgroundColor), With<DoomBarFill>>,
+        Query<(&mut Text, &mut TextColor), With<DoomCountText>>,
+    )>,
+) {
+    if let Ok(mut t) = q.p0().single_mut() {
+        t.0 = format!("{}", day.day);
+    }
+    let frac = day.frac();
+    if let Ok((mut node, mut color)) = q.p1().single_mut() {
+        node.width = Val::Percent(frac * 100.0);
+        let pulse = if frac > 0.85 {
+            0.65 + 0.35 * (time.elapsed_secs() * 6.0).sin().abs()
+        } else {
+            1.0
+        };
+        color.0 = if frac < 0.5 {
+            Color::srgb(0.45 + frac, 0.9, 1.0 - frac * 0.8)
+        } else if frac < 0.8 {
+            Color::srgb(1.0, 0.84 - (frac - 0.5) * 1.2, 0.30)
+        } else {
+            Color::srgba(1.0, 0.25, 0.15, pulse)
+        };
+    }
+    if let Ok((mut t, mut c)) = q.p2().single_mut() {
+        let rem = day.remaining();
+        t.0 = format!("{}:{:02}", (rem / 60.0) as i32, (rem % 60.0) as i32);
+        c.0 = if frac > 0.8 {
+            Color::srgb(1.0, 0.4, 0.3)
+        } else {
+            TEXT_DIM
+        };
+    }
+}
+
+/// Dread vignette + whiteout flash + the DAY N splash.
+#[allow(clippy::type_complexity)]
+fn hud_dread_fx(
+    time: Res<Time>,
+    day: Res<DayState>,
+    bh: Res<BlackHole>,
+    mut q: ParamSet<(
+        Query<&mut BorderColor, With<DangerVignette>>,
+        Query<&mut BackgroundColor, With<Whiteout>>,
+        Query<&mut Visibility, With<DaySplash>>,
+        Query<(&mut Text, &mut TextColor), With<DaySplashText>>,
+    )>,
+) {
+    if let Ok(mut border) = q.p0().single_mut() {
+        let d = bh.dread;
+        let a = if d > 0.45 {
+            (d - 0.45) / 0.55 * (0.35 + 0.25 * (time.elapsed_secs() * 3.0).sin().abs())
+        } else {
+            0.0
+        };
+        *border = BorderColor::all(Color::srgba(1.0, 0.15, 0.08, a));
+    }
+    if let Ok(mut bg) = q.p1().single_mut() {
+        bg.0 = Color::srgba(1.0, 0.98, 0.95, day.whiteout);
+    }
+    let show = day.phase == DayPhase::Dawn;
+    if let Ok(mut vis) = q.p2().single_mut() {
+        *vis = if show {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if show {
+        if let Ok((mut t, mut c)) = q.p3().single_mut() {
+            t.0 = format!("DAY {}", day.day);
+            // Legible on the white flash, fading out with it.
+            c.0 = Color::srgba(0.10, 0.16, 0.22, (day.whiteout * 2.2).clamp(0.0, 1.0));
+        }
     }
 }
 

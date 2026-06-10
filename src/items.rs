@@ -317,6 +317,7 @@ pub fn spawn_sparks(
 fn drop_physics(
     time: Res<Time>,
     world: Res<VoxelWorld>,
+    bh: Res<crate::blackhole::BlackHole>,
     mut drops: Query<(Entity, &mut DropItem, &mut Transform)>,
     mut commands: Commands,
 ) {
@@ -330,6 +331,11 @@ fn drop_physics(
         // Zero-G drift with damping, so loot hangs near where it popped.
         let v = drop.vel;
         drop.vel = v * (-DRIFT_DAMP * 1.8 * dt).exp();
+        // The singularity claims unattended loot. A floor on the pull keeps a
+        // faint, ominous drift toward it even early in the day.
+        let pull = bh.pull(tf.translation);
+        let pull = pull.normalize_or_zero() * pull.length().max(0.25) * 0.6;
+        drop.vel += pull * dt;
         // Per-axis point collision: stop the axis instead of entering a wall.
         let mut p = tf.translation;
         for axis in 0..3 {
@@ -438,6 +444,7 @@ fn charge_place(
 #[allow(clippy::too_many_arguments)]
 fn charge_tick(
     time: Res<Time>,
+    bh: Res<crate::blackhole::BlackHole>,
     mut world: ResMut<VoxelWorld>,
     mut charges: Query<(Entity, &mut PlasmaCharge, &mut Transform)>,
     mut assets: ResMut<ItemAssets>,
@@ -467,7 +474,9 @@ fn charge_tick(
             );
             continue;
         }
-        // Plasma torpedo: sails straight in zero-G until it sticks.
+        // Plasma torpedo: sails in zero-G until it sticks — its arc bends
+        // toward the singularity like everything else.
+        charge.vel += bh.pull(tf.translation) * dt;
         let mut p = tf.translation;
         for axis in 0..3 {
             let mut np = p;
