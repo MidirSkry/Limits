@@ -31,31 +31,53 @@ use crate::world::{ChunkEntities, VoxelWorld};
 // Tunables
 // ---------------------------------------------------------------------------
 
-/// Direction from the origin to the singularity. Chosen away from the sun and
-/// the gas giant so it owns its own region of sky.
-const BH_DIR: Vec3 = Vec3::new(-0.65, -0.08, 0.62);
-/// Distance from origin at day start / day end (m). It *approaches*.
-const DIST_START: f32 = 5_600.0;
+/// The system axis and the star's seat — shared with worldgen, which strings
+/// the planets along the same ray (closer to the star = higher tier).
+const BH_DIR: Vec3 = crate::world::SYSTEM_AXIS;
+const DIST_START: f32 = crate::world::STAR_DIST;
 const DIST_END: f32 = 1_350.0;
-/// Event horizon radius (m). At day's end this fills half the sky.
+/// Event horizon radius (m) at FULL size. The hole is born at half this and
+/// grows all day as it feeds; visuals scale with it via the root transform.
 const HORIZON_R: f32 = 560.0;
-/// Accretion disc annulus (m).
+/// Accretion disc annulus (m), at full size.
 const DISC_IN: f32 = HORIZON_R * 1.45;
 const DISC_OUT: f32 = HORIZON_R * 4.6;
 /// Real-time session length (s). `LIMITS_DAY_S` overrides for testing.
 const DAY_S_DEFAULT: f32 = 600.0;
 
-/// Pull at the home rock at day start / end (m/s²). Thrust is 16 — past the
-/// crossover there is no escape, only a deadline.
+/// The day OPENS with the system's star collapsing: it hangs in the sky
+/// through the dawn fade, swells, detonates (supernova flash + a shockwave
+/// shell that rolls over the player), and falls into itself — the hole
+/// assembly then grows out of the wreckage. Timed against Active `elapsed`.
+const STAR_R: f32 = 800.0;
+const STAR_SWELL_S: f32 = 1.6;
+const STAR_DETONATE_S: f32 = 4.0;
+const STAR_COLLAPSE_S: f32 = 1.3;
+const HOLE_GROW_S: f32 = 2.6;
+const SHOCK_SPEED: f32 = 1_000.0;
+
+/// Pull at the home rock at day start / nominal day end (m/s²). Thrust is 16
+/// — past the crossover there is no escape. There is NO timer: past the
+/// nominal day the hole simply keeps coming (advancing along its ray, sweeping
+/// the field) and keeps growing (gm doubles every OVERTIME_DOUBLE_S), so both
+/// hiding behind rock and fleeing into deep space only buy minutes.
 const PULL_HOME_START: f32 = 0.02;
 const PULL_HOME_END: f32 = 26.0;
 /// Acceleration cap so the math stays integrable at point-blank range.
 const PULL_CAP: f32 = 65.0;
 /// Grounded players get ripped off the surface above this pull (m/s²).
 const RIP_ACCEL: f32 = 7.0;
+/// Overtime mass growth: gm doubles this often (s) once the nominal day is
+/// spent — guarantees pull eventually beats thrust at ANY distance.
+const OVERTIME_DOUBLE_S: f32 = 45.0;
 
-/// Begin the death dive inside this multiple of the horizon radius.
+/// Begin the death dive inside this multiple of the horizon radius...
 const FALL_TRIGGER: f32 = 1.2;
+/// ...or when pull is hopeless (>2.5x thrust) AND you're already being
+/// dragged inward this fast (m/s). A player pinned against rock doesn't
+/// trip this — the advancing horizon comes for them instead.
+const DIVE_PULL: f32 = 40.0;
+const DIVE_INWARD_V: f32 = 12.0;
 /// The dive "lands" (reset fires) inside this multiple.
 const FALL_IMPACT: f32 = 0.5;
 /// Dawn fade-in length (s).
@@ -93,12 +115,16 @@ pub struct DayState {
 }
 
 impl DayState {
-    /// Day-fraction spent, 0..1.
+    /// Nominal-day fraction spent, 0..1 (the approach schedule, not a cutoff).
     pub fn frac(&self) -> f32 {
         (self.elapsed / self.day_len).clamp(0.0, 1.0)
     }
     pub fn remaining(&self) -> f32 {
         (self.day_len - self.elapsed).max(0.0)
+    }
+    /// Seconds past the nominal day — the hole's runaway phase.
+    pub fn overtime(&self) -> f32 {
+        (self.elapsed - self.day_len).max(0.0)
     }
 }
 
@@ -139,7 +165,9 @@ impl BlackHole {
             PULL_HOME_START * (PULL_HOME_END / PULL_HOME_START).powf(frac);
         Self {
             center: BH_DIR.normalize() * dist,
-            horizon_r: HORIZON_R,
+            // Starts at zero: the hole doesn't exist until the star falls in.
+            // day_cycle drives the real value (birth + all-day growth).
+            horizon_r: 0.0,
             gm: pull_home * dist * dist,
             dread: 0.0,
         }
@@ -169,6 +197,7 @@ impl Plugin for BlackHolePlugin {
                 (
                     (day_cycle, bh_gravity, day_reset).chain().after(crate::GameplaySet),
                     (place_blackhole, billboard_rings, spin_disc, animate_streaks),
+                    (star_cycle, animate_eat_streaks),
                 ),
             );
     }
@@ -202,6 +231,68 @@ struct BhStreak {
     /// Inward drift rate (m/s) and size scale.
     rate: f32,
     size: f32,
+}
+
+/// Shared mesh/material for asteroid-consumption shards (lod.rs spawns them
+/// when the advancing horizon swallows a far rock).
+#[derive(Resource)]
+pub struct EatFx {
+    mesh: Handle<Mesh>,
+    mat: Handle<StandardMaterial>,
+}
+
+/// A doomed rock's last light: a hot shard streaking from where the asteroid
+/// was into the horizon, in world space.
+#[derive(Component)]
+struct EatStreak {
+    vel: Vec3,
+    ttl: f32,
+    ttl_max: f32,
+}
+
+/// Spawn the shards for one consumed asteroid.
+pub fn spawn_eat_streaks(commands: &mut Commands, fx: &EatFx, from: Vec3, hole: Vec3) {
+    let to = hole - from;
+    let ttl = 1.6;
+    let dir = to / ttl; // arrive at the center as the shard dies
+    for k in 0..3u64 {
+        let side = Vec3::new(
+            hash01(k, from.x.to_bits() as u64) - 0.5,
+            hash01(k, from.y.to_bits() as u64) - 0.5,
+            hash01(k, from.z.to_bits() as u64) - 0.5,
+        ) * 30.0;
+        commands.spawn((
+            Mesh3d(fx.mesh.clone()),
+            MeshMaterial3d(fx.mat.clone()),
+            Transform::from_translation(from + side)
+                .looking_to(dir.normalize_or_zero(), Vec3::Y)
+                .with_scale(Vec3::new(5.0, 5.0, 70.0)),
+            EatStreak {
+                vel: dir,
+                ttl,
+                ttl_max: ttl,
+            },
+        ));
+    }
+}
+
+fn animate_eat_streaks(
+    time: Res<Time>,
+    mut streaks: Query<(Entity, &mut EatStreak, &mut Transform)>,
+    mut commands: Commands,
+) {
+    let dt = time.delta_secs();
+    for (e, mut s, mut tf) in &mut streaks {
+        s.ttl -= dt;
+        if s.ttl <= 0.0 {
+            commands.entity(e).despawn();
+            continue;
+        }
+        let v = s.vel;
+        tf.translation += v * dt;
+        let frac = (s.ttl / s.ttl_max).clamp(0.0, 1.0);
+        tf.scale = Vec3::new(5.0 * frac, 5.0 * frac, 70.0 + 80.0 * (1.0 - frac));
+    }
 }
 
 fn hash01(i: u64, salt: u64) -> f32 {
@@ -382,12 +473,164 @@ fn setup_blackhole(
     commands
         .entity(root)
         .add_children(&[horizon, photon, halo, disc]);
+
+    // Consumption-shard assets for lod.rs.
+    commands.insert_resource(EatFx {
+        mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+        mat: materials.add(StandardMaterial {
+            base_color: Color::linear_rgba(7.0, 4.0, 1.8, 0.8),
+            unlit: true,
+            alpha_mode: AlphaMode::Add,
+            cull_mode: None,
+            ..default()
+        }),
+    });
+
+    // The doomed star — whole through the dawn, gone by breakfast. Separate
+    // from the root so the hole's scale animation doesn't touch it.
+    let star_mat = materials.add(StandardMaterial {
+        base_color: Color::linear_rgb(13.0, 10.0, 5.5),
+        unlit: true,
+        ..default()
+    });
+    commands.insert_resource(StarAssets {
+        star_mat: star_mat.clone(),
+        shock_mesh: meshes.add(Sphere::new(1.0).mesh().ico(3).unwrap()),
+        shock_mat: materials.add(StandardMaterial {
+            base_color: Color::linear_rgba(3.0, 2.2, 1.5, 0.16),
+            unlit: true,
+            alpha_mode: AlphaMode::Add,
+            cull_mode: None,
+            ..default()
+        }),
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(STAR_R).mesh().ico(3).unwrap())),
+        MeshMaterial3d(star_mat),
+        Transform::from_translation(bh.center),
+        BhStar,
+    ));
+}
+
+#[derive(Component)]
+struct BhStar;
+
+#[derive(Resource)]
+struct StarAssets {
+    star_mat: Handle<StandardMaterial>,
+    shock_mesh: Handle<Mesh>,
+    shock_mat: Handle<StandardMaterial>,
+}
+
+/// The supernova's expanding blast shell; `hit` flips when it rolls over the
+/// player (boom + shake arrive at lightspeed-ish delay — sound in space is a
+/// lie we tell for drama).
+#[derive(Component)]
+struct ShockShell {
+    age: f32,
+    origin: Vec3,
+    hit: bool,
+}
+
+/// Drive the opening spectacle: steady star → swell → detonation (shockwave
+/// + flash + SFX) → collapse to nothing as the hole assembly grows in.
+#[allow(clippy::too_many_arguments)]
+fn star_cycle(
+    time: Res<Time>,
+    day: Res<DayState>,
+    bh: Res<BlackHole>,
+    player: Res<PlayerState>,
+    assets: Res<StarAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut stars: Query<(&mut Transform, &mut Visibility), With<BhStar>>,
+    mut shells: Query<(Entity, &mut ShockShell, &mut Transform), Without<BhStar>>,
+    mut sfx: ResMut<SfxQueue>,
+    mut shake: ResMut<Shake>,
+    mut prev_elapsed: Local<f32>,
+    mut commands: Commands,
+) {
+    let dt = time.delta_secs();
+
+    // Animate + retire shock shells regardless of phase.
+    for (e, mut shell, mut tf) in &mut shells {
+        shell.age += dt;
+        if shell.age > 7.0 {
+            commands.entity(e).despawn();
+            continue;
+        }
+        let r = SHOCK_SPEED * shell.age;
+        tf.scale = Vec3::splat(r);
+        if !shell.hit && r >= shell.origin.distance(player.pos) {
+            shell.hit = true;
+            sfx.push(SfxEvent::Explosion);
+            shake.add(0.55);
+        }
+    }
+
+    let Ok((mut tf, mut vis)) = stars.single_mut() else {
+        return;
+    };
+    tf.translation = bh.center;
+
+    let t = match day.phase {
+        // Through the dawn fade the star just hangs there, pristine.
+        DayPhase::Dawn => -1.0,
+        _ => day.elapsed,
+    };
+    let detonated_at = STAR_DETONATE_S;
+    let swell_from = detonated_at - STAR_SWELL_S;
+
+    if t >= detonated_at + STAR_COLLAPSE_S {
+        *vis = Visibility::Hidden;
+        *prev_elapsed = t;
+        return;
+    }
+    *vis = Visibility::Visible;
+
+    let pulse = 1.0 + 0.015 * (time.elapsed_secs() * 2.3).sin();
+    let (scale, glow) = if t < swell_from {
+        (pulse, 1.0)
+    } else if t < detonated_at {
+        // Swelling: the last seconds of a star's life.
+        let k = ((t - swell_from) / STAR_SWELL_S).clamp(0.0, 1.0);
+        (1.0 + 0.5 * k * k, 1.0 + 4.0 * k * k)
+    } else {
+        // Collapse: everything it was, gone inward in a heartbeat.
+        let k = ((t - detonated_at) / STAR_COLLAPSE_S).clamp(0.0, 1.0);
+        ((1.5 * (1.0 - k * k)).max(0.01), 6.0 * (1.0 - k) + 1.0)
+    };
+    tf.scale = Vec3::splat(scale);
+    if let Some(mat) = materials.get_mut(&assets.star_mat) {
+        mat.base_color = Color::linear_rgb(13.0 * glow, 10.0 * glow, 5.5 * glow);
+    }
+
+    // Detonation crossing: one shockwave, one supernova roar, per day.
+    if *prev_elapsed < detonated_at && t >= detonated_at {
+        sfx.push(SfxEvent::Supernova);
+        shake.add(0.2);
+        commands.spawn((
+            Mesh3d(assets.shock_mesh.clone()),
+            MeshMaterial3d(assets.shock_mat.clone()),
+            Transform::from_translation(bh.center).with_scale(Vec3::splat(1.0)),
+            ShockShell {
+                age: 0.0,
+                origin: bh.center,
+                hit: false,
+            },
+        ));
+    }
+    *prev_elapsed = t;
 }
 
 
+/// Track the singularity's position AND size: every visual is a child of the
+/// root, meshed at full-size dimensions, so one uniform scale grows the whole
+/// assembly from newborn to end-of-day monster.
 fn place_blackhole(bh: Res<BlackHole>, mut roots: Query<&mut Transform, With<BhRoot>>) {
+    let s = (bh.horizon_r / HORIZON_R).max(0.0001);
     for mut tf in &mut roots {
         tf.translation = bh.center;
+        tf.scale = Vec3::splat(s);
     }
 }
 
@@ -486,18 +729,35 @@ fn day_cycle(
         DayPhase::Active => {
             day.elapsed += dt;
             let frac = day.frac();
-            let next = BlackHole::at(frac);
-            bh.center = next.center;
-            bh.gm = next.gm;
+            let ot = day.overtime();
+            if ot <= 0.0 {
+                let next = BlackHole::at(frac);
+                bh.center = next.center;
+                bh.gm = next.gm;
+            } else {
+                // OVERTIME — no timer, just physics with the gloves off. The
+                // hole keeps advancing along its ray at its end-of-day speed
+                // (accelerating), sweeping the field and engulfing anything
+                // braced against rock; its mass doubles every 45s so a
+                // flee-er's pull deficit always closes.
+                let v_end = 1.6 * (DIST_START - DIST_END) / day.day_len;
+                let dist = DIST_END - v_end * (ot + ot * ot / 80.0);
+                bh.center = BH_DIR.normalize() * dist;
+                let gm_end = PULL_HOME_END * DIST_END * DIST_END;
+                bh.gm = gm_end * 2.0f32.powf(ot / OVERTIME_DOUBLE_S);
+            }
 
-            // Threshold warnings — the deadline must never be a surprise.
+            // Threshold warnings — the collapse must never be a surprise.
             let mins = (day.remaining() / 60.0).floor() as i32;
             let secs = (day.remaining() % 60.0) as i32;
             let warn = |s: &mut StatusMsg, q: &mut SfxQueue, msg: String| {
                 s.set(msg);
                 q.push(SfxEvent::Overheat);
             };
-            if frac >= 0.92 && *warn_stage < 3 {
+            if ot > 0.0 && *warn_stage < 4 {
+                *warn_stage = 4;
+                warn(&mut status, &mut sfx, "BORROWED TIME — IT IS COMING FOR THE FIELD".into());
+            } else if frac >= 0.92 && *warn_stage < 3 {
                 *warn_stage = 3;
                 warn(&mut status, &mut sfx, "EVENT HORIZON IMMINENT — GET CLEAR OR GET CONSUMED".into());
             } else if frac >= 0.75 && *warn_stage < 2 {
@@ -508,14 +768,37 @@ fn day_cycle(
                 warn(&mut status, &mut sfx, format!("Half the day gone — {mins}:{secs:02} until collapse"));
             }
 
+            // The hole is born from the collapsing star at ~half size and
+            // grows all day as it feeds (overtime: keeps creeping). Visuals
+            // scale with horizon_r via the root transform.
+            let birth = ((day.elapsed - STAR_DETONATE_S) / HOLE_GROW_S).clamp(0.0, 1.0);
+            let birth = birth * birth * (3.0 - 2.0 * birth);
+            let size = (0.5 + 0.7 * frac + ot * 0.0015).min(1.5);
+            bh.horizon_r = HORIZON_R * size * birth;
+
             // Dread: time pressure or proximity, whichever screams louder.
             let pull = bh.pull(player.pos).length();
-            bh.dread = (frac * frac * 0.85).max((pull / 22.0).clamp(0.0, 1.0));
-            day.whiteout = 0.0;
+            bh.dread = (frac * frac * 0.85 + ot / 60.0)
+                .max((pull / 22.0).clamp(0.0, 1.0))
+                .min(1.0);
 
-            // Fall triggers: deadline, or flying too close.
-            let dist = player.pos.distance(bh.center);
-            if day.elapsed >= day.day_len || dist < bh.horizon_r * FALL_TRIGGER {
+            // Supernova flash washes the screen as the star goes.
+            let since_boom = day.elapsed - STAR_DETONATE_S;
+            day.whiteout = if (0.0..0.8).contains(&since_boom) {
+                0.45 * (1.0 - since_boom / 0.8)
+            } else {
+                0.0
+            };
+
+            // The dive triggers PHYSICALLY: grazing the horizon, or being
+            // dragged inward with no mathematical way back. A player pinned
+            // behind rock triggers neither — the horizon advances onto them.
+            let to_hole = bh.center - player.pos;
+            let dist = to_hole.length();
+            let inward_v = player.vel.dot(to_hole / dist.max(1.0));
+            if dist < bh.horizon_r * FALL_TRIGGER
+                || (pull > DIVE_PULL && inward_v > DIVE_INWARD_V)
+            {
                 day.phase = DayPhase::Falling;
                 day.phase_t = 0.0;
                 sfx.push(SfxEvent::Collapse);
@@ -571,6 +854,8 @@ fn day_cycle(
             let t = day.phase_t;
             day.whiteout = (1.0 - t / DAWN_S).clamp(0.0, 1.0).powf(1.4);
             bh.dread = 0.0;
+            // No hole yet — the star hangs whole in the sky until it goes.
+            bh.horizon_r = 0.0;
             for mut proj in &mut projections {
                 if let Projection::Perspective(p) = &mut *proj {
                     p.fov = 1.22;

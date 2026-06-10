@@ -34,10 +34,11 @@ const CHUNK_M: f32 = CHUNK as f32 * VOXEL; // 4m
 
 /// Asteroid field: one cell of space may hold one asteroid.
 pub const CELL_M: f32 = 56.0;
-/// Chance a cell hosts an asteroid. Deliberately sparse — the black hole is
-/// the landmark now, and each rock should feel like a destination. A starter
-/// rock is guaranteed within a couple of cells of home (see `starter_cell`).
-const CELL_DENSITY: f32 = 0.035;
+/// Chance a cell hosts an asteroid. Deliberately sparse — the planets and the
+/// black hole are the landmarks now, and each rock should feel like a
+/// destination. A starter rock is guaranteed within a couple of cells of home
+/// (see `starter_cell`).
+const CELL_DENSITY: f32 = 0.018;
 /// Asteroid radii (pre-displacement), small ones common, big ones rare.
 /// Rarer field = bigger rocks, so a find is worth the flight.
 const R_MIN: f32 = 6.0;
@@ -55,6 +56,19 @@ const FREQ_MAX: f32 = 3.2;
 pub const HOME_R: f32 = 15.0;
 /// Distance from home per difficulty tier ("sector").
 pub const TIER_M: f32 = 120.0;
+
+/// The solar system's axis: home sits at the system's edge (the belt), the
+/// dying star / black hole at the far end of this ray, the planets strung
+/// out between. blackhole.rs places the singularity on this same axis.
+pub const SYSTEM_AXIS: Vec3 = Vec3::new(-0.65, -0.08, 0.62);
+/// Where the star sits at day start (m from origin) — planets are placed
+/// relative to this so the closest one orbits deep in the kill zone.
+pub const STAR_DIST: f32 = 5_600.0;
+pub const PLANET_COUNT: usize = 6;
+/// Planet radii (pre-displacement). HUGE relative to asteroids — these are
+/// landable worlds, mined exactly like asteroids (same voxel pipeline).
+const PLANET_R_MIN: f32 = 90.0;
+const PLANET_R_MAX: f32 = 240.0;
 
 /// Regolith shell thickness (m) on every asteroid.
 const SHELL_M: f32 = 0.6;
@@ -449,6 +463,61 @@ fn cell_of(p: Vec3) -> IVec3 {
     (p / CELL_M).floor().as_ivec3()
 }
 
+// ---------------------------------------------------------------------------
+// Planets — a handful of huge landable bodies strung along the system axis.
+// The closer a planet orbits to the dying star, the higher its tier: endgame
+// HP walls guarding endgame crystal, and the black hole sweeps them up one by
+// one as it advances through the day. Pure function of the world salt.
+// ---------------------------------------------------------------------------
+
+/// Build the day's planets from a salt. Index 0 is nearest home (lowest
+/// tier); the last is deep in the star's kill zone (highest tier).
+fn build_planets(salt: u64) -> Vec<Asteroid> {
+    let axis = SYSTEM_AXIS.normalize();
+    // Two perpendicular directions to scatter planets off the axis.
+    let side = axis.cross(Vec3::Y).normalize();
+    let up = axis.cross(side).normalize();
+    (0..PLANET_COUNT)
+        .map(|i| {
+            let seed = hash3(
+                IVec3::new(i as i32 + 11, 47, -23),
+                salt.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x7AB1_E7,
+            );
+            let u = |k: u64| seed_unit(seed, k);
+            let t = (i as f32 + 1.0) / (PLANET_COUNT as f32 + 1.0);
+            let along = 900.0 + t * (STAR_DIST - 1_200.0 - 900.0);
+            let lateral = 450.0 + 900.0 * u(1);
+            let ang = u(2) * std::f32::consts::TAU;
+            let center = axis * along + (side * ang.cos() + up * ang.sin()) * lateral;
+            let radius = PLANET_R_MIN + (PLANET_R_MAX - PLANET_R_MIN) * u(3);
+            // Tier climbs toward the star: 4 (outermost) .. 12 (innermost).
+            let tier = 4 + ((i as f32 / (PLANET_COUNT - 1) as f32) * 8.0).round() as i32;
+            let mut p = Asteroid::shaped(center, radius, seed, tier);
+            // Worlds, not potatoes: rounder, gentler relief than asteroids.
+            p.stretch = Vec3::ONE.lerp(p.stretch, 0.12);
+            p.amp = 0.04 + 0.06 * u(4);
+            p.freq = 1.2 + 0.8 * u(5);
+            p
+        })
+        .collect()
+}
+
+/// The day's planets, cached per world salt (this is called from hot worldgen
+/// paths; rebuilding ~6 structs from hashes per query would add up).
+pub fn planet_list() -> std::sync::Arc<Vec<Asteroid>> {
+    use std::sync::{Arc, RwLock};
+    static CACHE: RwLock<Option<(u64, Arc<Vec<Asteroid>>)>> = RwLock::new(None);
+    let salt = WORLD_SALT.load(Ordering::Relaxed);
+    if let Some((s, list)) = CACHE.read().unwrap().as_ref() {
+        if *s == salt {
+            return list.clone();
+        }
+    }
+    let list = Arc::new(build_planets(salt));
+    *CACHE.write().unwrap() = Some((salt, list.clone()));
+    list
+}
+
 /// The cell guaranteed to host a starter rock near home — the field is sparse
 /// now, so without this an unlucky day could strand a fresh claim. Direction
 /// varies with the world salt; always within 2 cells (~120m, tier 0/1).
@@ -496,6 +565,12 @@ pub fn asteroid_in_cell(c: IVec3) -> Option<Asteroid> {
     if !starter && center.length() < HOME_R + radius + 10.0 {
         return None;
     }
+    // No belt rocks embedded in (or grazing) a planet.
+    for p in planet_list().iter() {
+        if center.distance(p.center) < p.reach() + radius + 8.0 {
+            return None;
+        }
+    }
     Some(Asteroid::shaped(
         center,
         radius,
@@ -505,7 +580,8 @@ pub fn asteroid_in_cell(c: IVec3) -> Option<Asteroid> {
     ))
 }
 
-/// All asteroids whose displaced surface could intersect the AABB (meters).
+/// All bodies (belt asteroids AND planets) whose displaced surface could
+/// intersect the AABB (meters).
 pub fn asteroids_overlapping(min_m: Vec3, max_m: Vec3) -> Vec<Asteroid> {
     let pad = R_MAX * STRETCH_MAX * (0.95 + AMP_MAX) + 0.5;
     let lo = cell_of(min_m - Vec3::splat(pad));
@@ -521,6 +597,13 @@ pub fn asteroids_overlapping(min_m: Vec3, max_m: Vec3) -> Vec<Asteroid> {
                     }
                 }
             }
+        }
+    }
+    // Planets are too big for the cell registry — checked directly.
+    for p in planet_list().iter() {
+        let closest = p.center.clamp(min_m, max_m);
+        if closest.distance(p.center) <= p.reach() {
+            out.push(*p);
         }
     }
     out
@@ -1326,6 +1409,41 @@ mod tests {
             }
         }
         assert!(checked, "expected at least one ordinary asteroid within 6 cells");
+    }
+
+    #[test]
+    fn planets_form_a_landable_solar_system() {
+        let ps = planet_list();
+        assert_eq!(ps.len(), PLANET_COUNT);
+        // Deterministic.
+        let ps2 = planet_list();
+        assert_eq!(ps[0].center, ps2[0].center);
+        let axis = SYSTEM_AXIS.normalize();
+        let mut last_along = 0.0;
+        for (i, p) in ps.iter().enumerate() {
+            // Strung outward along the system axis, tiers climbing toward
+            // the star — the endgame lives in the kill zone.
+            let along = p.center.dot(axis);
+            assert!(along > last_along, "planet {i} out of order");
+            last_along = along;
+            if i > 0 {
+                assert!(p.tier >= ps[i - 1].tier);
+            }
+            assert!(p.radius >= 90.0 && p.radius <= 240.0);
+            // Landable: solid voxels just under the surface, vacuum above —
+            // same worldgen pipeline as any asteroid.
+            let dir = (Vec3::ZERO - p.center).normalize();
+            let surf = p.surface_toward(p.center + dir);
+            let solid_p = p.center + dir * (surf - 1.5);
+            let air_p = p.center + dir * (surf + 3.0);
+            let v_solid = (solid_p / VOXEL).floor().as_ivec3();
+            let v_air = (air_p / VOXEL).floor().as_ivec3();
+            assert_ne!(block_at(v_solid), AIR, "planet {i} has no ground");
+            assert_eq!(block_at(v_air), AIR, "planet {i} surface buried");
+            // Mining it pays its own tier.
+            assert_eq!(tier_of_voxel(v_solid), p.tier);
+        }
+        assert!(ps.last().unwrap().tier >= 10, "innermost planet must be endgame");
     }
 
     #[test]

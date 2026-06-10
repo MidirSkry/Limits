@@ -11,7 +11,7 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::player::PlayerState;
 use crate::world::{self, Asteroid, CELL_M};
@@ -39,8 +39,100 @@ pub struct LodPlugin;
 
 impl Plugin for LodPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Impostors>()
-            .add_systems(Update, (impostor_sweep, impostor_build, impostor_swap));
+        app.init_resource::<Impostors>().add_systems(
+            Update,
+            (
+                ensure_planet_impostors,
+                impostor_sweep,
+                impostor_build,
+                impostor_swap,
+                planet_consume,
+            ),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Planets — one big impostor each, alive all day
+// ---------------------------------------------------------------------------
+
+#[derive(Component)]
+struct PlanetImpostor {
+    idx: usize,
+    center: Vec3,
+}
+
+/// (Re)build planet impostors whenever none exist — at boot and on the frame
+/// after a dawn reset (despawn_all empties the list; the world salt has
+/// already changed, so this picks up the NEW day's planets).
+fn ensure_planet_impostors(
+    mut imp: ResMut<Impostors>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut commands: Commands,
+) {
+    if !imp.planets.is_empty() {
+        return;
+    }
+    let material = imp
+        .material
+        .get_or_insert_with(|| {
+            materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                perceptual_roughness: 0.95,
+                ..default()
+            })
+        })
+        .clone();
+    let planets = world::planet_list();
+    for (idx, p) in planets.iter().enumerate() {
+        let e = commands
+            .spawn((
+                Mesh3d(meshes.add(impostor_mesh(p, 4))),
+                MeshMaterial3d(material.clone()),
+                Transform::from_translation(p.center),
+                PlanetImpostor {
+                    idx,
+                    center: p.center,
+                },
+            ))
+            .id();
+        imp.planets.push(e);
+    }
+}
+
+/// The advancing horizon swallows planets whole. Hide the impostor and fire a
+/// burst of consumption shards — from across the system you see a world die.
+fn planet_consume(
+    bh: Res<crate::blackhole::BlackHole>,
+    eat_fx: Option<Res<crate::blackhole::EatFx>>,
+    mut imp: ResMut<Impostors>,
+    mut planets: Query<(&PlanetImpostor, &mut Visibility)>,
+    mut commands: Commands,
+) {
+    for (p, mut vis) in &mut planets {
+        if imp.eaten_planets.contains(&p.idx) {
+            continue;
+        }
+        if p.center.distance(bh.center) < bh.horizon_r {
+            imp.eaten_planets.insert(p.idx);
+            *vis = Visibility::Hidden;
+            if let Some(fx) = &eat_fx {
+                for k in 0..4 {
+                    let off = Vec3::new(
+                        ((p.idx * 7 + k) % 5) as f32 - 2.0,
+                        ((p.idx * 3 + k) % 7) as f32 - 3.0,
+                        ((p.idx * 11 + k) % 3) as f32 - 1.0,
+                    ) * 40.0;
+                    crate::blackhole::spawn_eat_streaks(
+                        &mut commands,
+                        fx,
+                        p.center + off,
+                        bh.center,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -55,6 +147,15 @@ pub struct Impostors {
     /// Cell -> impostor entity (PLACEHOLDER while queued for build).
     map: HashMap<IVec3, Entity>,
     queue: Vec<IVec3>,
+    /// Rocks the event horizon has consumed this day — never rebuilt (the
+    /// hole advances past them, so a plain distance check would resurrect
+    /// them in its wake). Cleared by the dawn reset.
+    eaten: HashSet<IVec3>,
+    /// Planet impostor entities, by planet index. Unlike belt impostors these
+    /// live all day, visible from anywhere in the system (they ARE the
+    /// planet beyond chunk range; streamed chunks draw over them up close).
+    planets: Vec<Entity>,
+    eaten_planets: HashSet<usize>,
     material: Option<Handle<StandardMaterial>>,
 }
 
@@ -68,12 +169,20 @@ impl Impostors {
             }
         }
         self.queue.clear();
+        self.eaten.clear();
+        for e in self.planets.drain(..) {
+            commands.entity(e).despawn();
+        }
+        self.eaten_planets.clear();
     }
 }
 
-/// Discover asteroid cells entering range; retire impostors far behind us.
+/// Discover asteroid cells entering range; retire impostors far behind us;
+/// feed rocks the advancing event horizon has reached to the hole.
 fn impostor_sweep(
     player: Res<PlayerState>,
+    bh: Res<crate::blackhole::BlackHole>,
+    eat_fx: Option<Res<crate::blackhole::EatFx>>,
     mut imp: ResMut<Impostors>,
     mut commands: Commands,
     mut tick: Local<u32>,
@@ -89,7 +198,7 @@ fn impostor_sweep(
         for cy in -r_cells..=r_cells {
             for cx in -r_cells..=r_cells {
                 let cell = pc + IVec3::new(cx, cy, cz);
-                if imp.map.contains_key(&cell) {
+                if imp.map.contains_key(&cell) || imp.eaten.contains(&cell) {
                     continue;
                 }
                 let Some(a) = world::asteroid_in_cell(cell) else {
@@ -98,8 +207,38 @@ fn impostor_sweep(
                 if a.center.distance(player.pos) > IMPOSTOR_RADIUS_M {
                     continue;
                 }
+                // Already inside the hole: consumed before we ever saw it.
+                if a.center.distance(bh.center) < bh.horizon_r {
+                    imp.eaten.insert(cell);
+                    continue;
+                }
                 imp.map.insert(cell, Entity::PLACEHOLDER);
                 imp.queue.push(cell);
+            }
+        }
+    }
+
+    // Consumption pass: any impostor the horizon has reached is despawned
+    // with a shard of light streaking into the hole, and marked eaten so it
+    // never pops back in the hole's wake. The dawn reset clears the set.
+    let consumed: Vec<IVec3> = imp
+        .map
+        .iter()
+        .filter(|(cell, e)| {
+            **e != Entity::PLACEHOLDER
+                && ((cell.as_vec3() + Vec3::splat(0.5)) * CELL_M).distance(bh.center)
+                    < bh.horizon_r + CELL_M * 0.5
+        })
+        .map(|(c, _)| *c)
+        .collect();
+    for cell in consumed {
+        imp.eaten.insert(cell);
+        if let Some(e) = imp.map.remove(&cell) {
+            commands.entity(e).despawn();
+            if let Some(fx) = &eat_fx {
+                if let Some(a) = world::asteroid_in_cell(cell) {
+                    crate::blackhole::spawn_eat_streaks(&mut commands, fx, a.center, bh.center);
+                }
             }
         }
     }
@@ -132,6 +271,7 @@ fn impostor_sweep(
 
 /// Build queued impostor meshes, a few per frame.
 fn impostor_build(
+    bh: Res<crate::blackhole::BlackHole>,
     mut imp: ResMut<Impostors>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -158,9 +298,15 @@ fn impostor_build(
         let Some(a) = world::asteroid_in_cell(cell) else {
             continue;
         };
+        // The horizon may have reached a queued rock before its build slot.
+        if a.center.distance(bh.center) < bh.horizon_r {
+            imp.map.remove(&cell);
+            imp.eaten.insert(cell);
+            continue;
+        }
         let entity = commands
             .spawn((
-                Mesh3d(meshes.add(impostor_mesh(&a))),
+                Mesh3d(meshes.add(impostor_mesh(&a, 2))),
                 MeshMaterial3d(material.clone()),
                 Transform::from_translation(a.center).with_scale(Vec3::splat(0.01)),
                 Impostor {
@@ -174,11 +320,13 @@ fn impostor_build(
 }
 
 /// Displace a low-poly ico-sphere with the asteroid's own surface noise.
-fn impostor_mesh(a: &Asteroid) -> Mesh {
+/// Subdivision 2 (~160 verts) suits belt rocks; planets get 4 (~2.5k) since
+/// one mesh serves a 200m world all day.
+fn impostor_mesh(a: &Asteroid, subdiv: u32) -> Mesh {
     let base = Sphere::new(1.0)
         .mesh()
-        .ico(2)
-        .expect("ico(2) subdivision is valid");
+        .ico(subdiv)
+        .expect("ico subdivision is valid");
     let Some(VertexAttributeValues::Float32x3(dirs)) =
         base.attribute(Mesh::ATTRIBUTE_POSITION)
     else {

@@ -1286,6 +1286,8 @@ fn hud_shop(
 fn hud_doom(
     time: Res<Time>,
     day: Res<DayState>,
+    bh: Res<BlackHole>,
+    player: Res<PlayerState>,
     mut q: ParamSet<(
         Query<&mut Text, With<DayNumText>>,
         Query<(&mut Node, &mut BackgroundColor), With<DoomBarFill>>,
@@ -1312,13 +1314,20 @@ fn hud_doom(
         };
     }
     if let Ok((mut t, mut c)) = q.p2().single_mut() {
-        let rem = day.remaining();
-        t.0 = format!("{}:{:02}", (rem / 60.0) as i32, (rem % 60.0) as i32);
-        c.0 = if frac > 0.8 {
-            Color::srgb(1.0, 0.4, 0.3)
+        if day.overtime() > 0.0 {
+            // No clock left to show — show the thing that's actually coming.
+            let gap = (player.pos.distance(bh.center) - bh.horizon_r).max(0.0);
+            t.0 = format!("{:.0}m", gap);
+            c.0 = Color::srgb(1.0, 0.3, 0.2);
         } else {
-            TEXT_DIM
-        };
+            let rem = day.remaining();
+            t.0 = format!("{}:{:02}", (rem / 60.0) as i32, (rem % 60.0) as i32);
+            c.0 = if frac > 0.8 {
+                Color::srgb(1.0, 0.4, 0.3)
+            } else {
+                TEXT_DIM
+            };
+        }
     }
 }
 

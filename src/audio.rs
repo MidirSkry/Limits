@@ -41,6 +41,8 @@ pub enum SfxEvent {
     Consumed,
     /// A new day — quiet, warm, alive.
     Dawn,
+    /// The star detonates — the day's opening thunderclap.
+    Supernova,
 }
 
 #[derive(Resource, Default)]
@@ -89,6 +91,7 @@ struct Sfx {
     collapse: Handle<AudioSource>,
     consumed: Handle<AudioSource>,
     dawn: Handle<AudioSource>,
+    supernova: Handle<AudioSource>,
 }
 
 /// Entity of the always-running black-hole rumble loop (volume rides dread).
@@ -326,6 +329,19 @@ fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
             + noise(i) * expd(t, 0.05) * 0.6
     });
 
+    // Supernova: the day's opening thunderclap — first-instant crack, deep
+    // descending body, long radiant noise tail.
+    let mut brown4 = 0.0f32;
+    let mut lp6 = 0.0f32;
+    let supernova = render(4.5, |t, i| {
+        brown4 = (brown4 + 0.12 * noise(i)) * 0.9975;
+        lp6 += 0.10 * (noise(i) - lp6);
+        noise(i) * expd(t, 0.03)
+            + 0.9 * (TAU * (34.0 - 6.0 * t.min(2.0)) * t).sin() * (-t * 0.9).exp()
+            + brown4 * 6.5 * (-t * 0.7).exp()
+            + lp6 * 1.4 * (-t * 0.5).exp()
+    });
+
     // Dawn: three soft warm tones blooming out of silence.
     let dawn = render(1.6, |t, _| {
         let note = |f: f32, at: f32| {
@@ -357,6 +373,7 @@ fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
         collapse: audio.add(wav(collapse, 0.9)),
         consumed: audio.add(wav(consumed, 0.95)),
         dawn: audio.add(wav(dawn, 0.8)),
+        supernova: audio.add(wav(supernova, 0.95)),
     });
 
     // The void hum starts immediately and never stops.
@@ -403,6 +420,7 @@ fn play_queued(mut queue: ResMut<SfxQueue>, sfx: Res<Sfx>, mut commands: Command
             SfxEvent::Collapse => (&sfx.collapse, 0.85, 1.0),
             SfxEvent::Consumed => (&sfx.consumed, 0.95, 1.0),
             SfxEvent::Dawn => (&sfx.dawn, 0.55, 1.0),
+            SfxEvent::Supernova => (&sfx.supernova, 0.9, 1.0),
         };
         commands.spawn((
             AudioPlayer::new(handle.clone()),
