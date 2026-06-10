@@ -311,6 +311,16 @@ fn collides(world: &VoxelWorld, pos: Vec3) -> bool {
     false
 }
 
+/// World point on the struck face, jittered slightly so rapid-fire damage
+/// numbers fan out instead of stacking on one pixel.
+fn hit_point(v: IVec3, normal: IVec3) -> Vec3 {
+    let center = (v.as_vec3() + Vec3::splat(0.5)) * VOXEL;
+    let face = center + normal.as_vec3() * (VOXEL * 0.5);
+    // Cheap deterministic-ish jitter from a global frame-ish counter via coords.
+    let j = ((v.x.wrapping_mul(7) ^ v.y.wrapping_mul(13) ^ v.z.wrapping_mul(17)) & 7) as f32;
+    face + Vec3::new((j - 3.5) * 0.03, 0.05, (3.5 - j) * 0.03)
+}
+
 fn sync_camera(
     player: Res<PlayerState>,
     mut cameras: Query<&mut Transform, With<PlayerCamera>>,
@@ -376,10 +386,12 @@ fn mining(
     let mut remaining = *world.damage.get(&v).unwrap_or(&hp_max);
     if damage > 0.0 {
         remaining -= damage;
-        if remaining <= 0.0 {
+        let killed = remaining <= 0.0;
+        // Floating combat text at the struck face — bigger/gold on a kill.
+        crate::hud::spawn_damage_number(&mut commands, hit_point(v, hit.normal), damage, killed);
+        if killed {
             world.set_air(v);
-            // Loot is physical now: the block pops out as a drop you walk over
-            // to collect (a full pack just leaves it lying there).
+            // Loot is physical: the block pops out as a drop you walk over to collect.
             items::spawn_drop(&mut commands, &mut item_assets, &mut materials, v, id);
             items::spawn_block_debris(&mut commands, &item_assets, v);
             target.0 = None;

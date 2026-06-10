@@ -15,15 +15,11 @@ const BASE_DAMAGE: f32 = 4.0;
 const DAMAGE_GROWTH: f32 = 1.5;
 const BASE_SWINGS: f32 = 2.0;
 const SWINGS_GROWTH: f32 = 1.12;
-const BASE_CAPACITY: u32 = 16;
-const CAPACITY_PER_LEVEL: u32 = 8;
 
 const DAMAGE_COST: f64 = 12.0;
 const DAMAGE_COST_GROWTH: f64 = 1.65;
 const SWINGS_COST: f64 = 20.0;
 const SWINGS_COST_GROWTH: f64 = 1.7;
-const CAPACITY_COST: f64 = 30.0;
-const CAPACITY_COST_GROWTH: f64 = 1.8;
 pub const RECALL_COST: u64 = 200;
 
 /// How close (m) the player must be to the shop pad to trade.
@@ -43,7 +39,6 @@ pub struct Wallet {
 pub struct Upgrades {
     pub damage_lvl: u32,
     pub swings_lvl: u32,
-    pub capacity_lvl: u32,
     pub recall: bool,
 }
 
@@ -54,17 +49,11 @@ impl Upgrades {
     pub fn swings_per_sec(&self) -> f32 {
         BASE_SWINGS * SWINGS_GROWTH.powi(self.swings_lvl as i32)
     }
-    pub fn capacity(&self) -> u32 {
-        BASE_CAPACITY + CAPACITY_PER_LEVEL * self.capacity_lvl
-    }
     pub fn damage_cost(&self) -> u64 {
         (DAMAGE_COST * DAMAGE_COST_GROWTH.powi(self.damage_lvl as i32)).round() as u64
     }
     pub fn swings_cost(&self) -> u64 {
         (SWINGS_COST * SWINGS_COST_GROWTH.powi(self.swings_lvl as i32)).round() as u64
-    }
-    pub fn capacity_cost(&self) -> u64 {
-        (CAPACITY_COST * CAPACITY_COST_GROWTH.powi(self.capacity_lvl as i32)).round() as u64
     }
 }
 
@@ -215,16 +204,7 @@ fn shop_system(
             status.set(format!("Need ${cost} for speed upgrade"));
         }
     }
-    if keys.just_pressed(KeyCode::Digit3) {
-        let cost = upgrades.capacity_cost();
-        if try_buy(cost, &mut wallet) {
-            upgrades.capacity_lvl += 1;
-            status.set(format!("Pack capacity → {}", upgrades.capacity()));
-        } else {
-            status.set(format!("Need ${cost} for pack upgrade"));
-        }
-    }
-    if keys.just_pressed(KeyCode::Digit4) && !upgrades.recall {
+    if keys.just_pressed(KeyCode::Digit3) && !upgrades.recall {
         if try_buy(RECALL_COST, &mut wallet) {
             upgrades.recall = true;
             status.set("Recall device online — [T] surface, [G] dive to depth");

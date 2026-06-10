@@ -7,7 +7,8 @@ A Bevy 0.18 incremental mining game: first-person 3D voxel digging (0.25m cubes 
 - Click to grab the cursor. WASD + Space + mouse-look, hold **LMB** to mine the block under the crosshair (RPG-style: tool damage per swing vs block HP).
 - Every destroyed voxel drops physical loot (dirt/stone $1 at band 0, doubling per band; ore much more) that you walk over to magnet-collect; a full pack leaves drops lying on the ground.
 - **Q** tosses a TNT charge: 2s fuse, carves a 4m-radius sphere, every voxel drops loot. Free while the mechanic is being playtested.
-- **E** at the gold shop pad sells the pack; **1/2/3/4** buy damage / swing speed / capacity / recall device. **T** recalls to the surface, **G** dives back to best depth (after buying recall).
+- **E** at the gold shop pad sells everything (inventory is unlimited); **1/2/3** buy damage / swing speed / recall device. **T** recalls to the surface, **G** dives back to best depth (after buying recall).
+- Hits pop floating damage numbers (gold + larger on a killing blow). HUD is styled panels: stats top-left, reticle + target HP bar at center, shop panel by the pad, status toast at the bottom.
 - The whole progression curve (HP/value/cost growth factors) lives in the constants at the top of `src/game.rs` and `src/world.rs`.
 
 ## Architecture notes

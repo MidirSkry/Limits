@@ -8,7 +8,7 @@
 use bevy::prelude::*;
 use std::collections::HashMap;
 
-use crate::game::{Inventory, StatusMsg, Upgrades};
+use crate::game::{Inventory, StatusMsg};
 use crate::player::PlayerState;
 use crate::world::{
     band_of_depth, depth_of, loot_color, VoxelWorld, AIR, BARRIER, VOXEL,
@@ -229,23 +229,17 @@ fn drop_physics(
 fn drop_pickup(
     time: Res<Time>,
     player: Res<PlayerState>,
-    upgrades: Res<Upgrades>,
     mut inventory: ResMut<Inventory>,
-    mut status: ResMut<StatusMsg>,
     mut drops: Query<(Entity, &mut DropItem, &mut Transform)>,
     mut commands: Commands,
 ) {
     let dt = time.delta_secs().min(0.05);
+    // Inventory is unlimited — every drop in range glides in and is collected.
     let target = player.pos + Vec3::Y * 0.7;
-    let full = inventory.units >= upgrades.capacity();
     for (entity, mut drop, mut tf) in &mut drops {
         let to_player = target - tf.translation;
         let dist = to_player.length();
         if dist > MAGNET_RANGE {
-            continue;
-        }
-        if full {
-            status.set("Pack full! Sell at the surface shop [E]");
             continue;
         }
         if dist <= COLLECT_RANGE {
