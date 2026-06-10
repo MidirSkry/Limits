@@ -9,6 +9,7 @@ mod demo;
 mod game;
 mod hud;
 mod items;
+mod lod;
 mod player;
 mod sky;
 mod world;
@@ -60,6 +61,7 @@ fn main() {
             game::GamePlugin,
             hud::HudPlugin,
             sky::SkyPlugin,
+            lod::LodPlugin,
             audio::SoundPlugin,
             demo::DemoPlugin,
         ))

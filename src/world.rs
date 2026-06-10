@@ -33,9 +33,11 @@ pub const CHUNK: i32 = 16;
 const CHUNK_M: f32 = CHUNK as f32 * VOXEL; // 4m
 
 /// Asteroid field: one cell of space may hold one asteroid.
-const CELL_M: f32 = 56.0;
-/// Chance a cell hosts an asteroid.
-const CELL_DENSITY: f32 = 0.52;
+pub const CELL_M: f32 = 56.0;
+/// Chance a cell hosts an asteroid. Tuned with the impostor LOD in view:
+/// dense enough that a neighbor is always a short flight away, sparse enough
+/// that the sky reads as a field, not foam.
+const CELL_DENSITY: f32 = 0.20;
 /// Asteroid radii (pre-displacement), small ones common, big ones rare.
 const R_MIN: f32 = 5.0;
 const R_MAX: f32 = 17.0;
@@ -261,8 +263,10 @@ impl Asteroid {
         self.radius * (DISP_BASE + DISP_AMP)
     }
 
-    /// Displaced surface radius along the direction of `p`.
-    fn surface_toward(&self, p: Vec3) -> f32 {
+    /// Displaced surface radius along the direction of `p`. Public so the
+    /// impostor LOD can build silhouette-matched far meshes from the same
+    /// noise.
+    pub fn surface_toward(&self, p: Vec3) -> f32 {
         let dir = (p - self.center).normalize_or_zero();
         let s = Vec3::new(
             (self.seed & 0xFFFF) as f32,
@@ -420,6 +424,18 @@ pub fn surface_y_at(x_m: f32, z_m: f32) -> f32 {
         }
     }
     0.0
+}
+
+/// Far-LOD impostor vertex color: the tier's rock tone washed toward
+/// regolith grey (what a voxel asteroid averages to at distance), jittered.
+pub fn impostor_color(tier: i32, jitter01: f32) -> [f32; 3] {
+    let rock = ROCK_COLORS[(tier.max(0) as usize) % ROCK_COLORS.len()];
+    let j = (0.72 + 0.25 * jitter01) * 0.9;
+    [
+        (rock[0] * 0.6 + 0.24 * 0.4) * j,
+        (rock[1] * 0.6 + 0.22 * 0.4) * j,
+        (rock[2] * 0.6 + 0.20 * 0.4) * j,
+    ]
 }
 
 /// Per-vertex linear color for a block, with a little per-voxel brightness

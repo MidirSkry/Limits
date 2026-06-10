@@ -1,17 +1,18 @@
 //! HUD + floating combat text.
 //!
-//! Cockpit-style layout: a slim status bar across the top (credits · range /
-//! sector · speed), a reticle with heat bar + charge pips under it, a target
-//! panel, a per-row depot panel with affordability coloring, a status toast,
-//! a controls hint, and a screen-edge nav marker pointing home to the depot.
-//! Plus world-anchored float text (damage numbers, credit pops). A few dozen
-//! UI entities, so per-frame `format!` is fine here.
+//! Graphical, not textual: procedurally-baked pixel icons (no asset files),
+//! stat chips, a real heat bar, plasma pips, loot-color swatches for the
+//! hold, a depot panel built from key-chips + level dots + cost pills, and a
+//! screen-edge nav icon pointing home. Numbers stay as text — numbers are
+//! what text is for. The controls hint only exists while unfocused.
 
+use bevy::image::{Image, ImageSampler};
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::game::{shop_pos, Inventory, NearShop, StatusMsg, Upgrades, Wallet, RECALL_COST};
 use crate::player::{Focused, LaserState, PlayerState, TargetInfo};
-use crate::world::{loot_name, TIER_M};
+use crate::world::{loot_color, TIER_M};
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -21,12 +22,226 @@ const PANEL_BG: Color = Color::srgba(0.03, 0.05, 0.08, 0.80);
 const PANEL_BORDER: Color = Color::srgba(0.25, 0.65, 0.80, 0.45);
 const CREDITS: Color = Color::srgb(0.55, 1.0, 0.85);
 const CYAN: Color = Color::srgb(0.45, 0.9, 1.0);
+const MAGENTA: Color = Color::srgb(0.9, 0.4, 1.0);
 const GOLD: Color = Color::srgb(1.0, 0.84, 0.30);
 const TEXT_DIM: Color = Color::srgb(0.75, 0.84, 0.90);
 const TEXT_FAINT: Color = Color::srgb(0.50, 0.60, 0.68);
 const BAR_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.55);
 const AFFORD: Color = Color::srgb(0.55, 1.0, 0.75);
 const TOO_RICH: Color = Color::srgb(0.55, 0.58, 0.64);
+const PILL_OK_BG: Color = Color::srgba(0.10, 0.35, 0.22, 0.9);
+const PILL_NO_BG: Color = Color::srgba(0.12, 0.14, 0.18, 0.9);
+
+// ---------------------------------------------------------------------------
+// Pixel icons — 12x12 glyphs baked into Images at startup, tinted at use.
+// ---------------------------------------------------------------------------
+
+type Glyph = [&'static str; 12];
+
+const ICON_GEM: Glyph = [
+    "............",
+    ".....##.....",
+    "....####....",
+    "...######...",
+    "..########..",
+    ".##########.",
+    ".##########.",
+    "..########..",
+    "...######...",
+    "....####....",
+    ".....##.....",
+    "............",
+];
+const ICON_HOME: Glyph = [
+    ".....##.....",
+    "....####....",
+    "...##..##...",
+    "..##....##..",
+    ".##......##.",
+    ".##########.",
+    "..#......#..",
+    "..#..##..#..",
+    "..#..##..#..",
+    "..#..##..#..",
+    "..########..",
+    "............",
+];
+const ICON_CRATE: Glyph = [
+    "............",
+    ".##########.",
+    ".#...##...#.",
+    ".#...##...#.",
+    ".#...##...#.",
+    ".##########.",
+    ".#...##...#.",
+    ".#...##...#.",
+    ".#...##...#.",
+    ".##########.",
+    "............",
+    "............",
+];
+const ICON_SPEED: Glyph = [
+    "............",
+    ".#....#.....",
+    ".##...##....",
+    "..##...##...",
+    "...##...##..",
+    "....##...##.",
+    "....##...##.",
+    "...##...##..",
+    "..##...##...",
+    ".##...##....",
+    ".#....#.....",
+    "............",
+];
+const ICON_BOLT: Glyph = [
+    "......##....",
+    ".....###....",
+    "....###.....",
+    "...###......",
+    "..######....",
+    ".....###....",
+    "....###.....",
+    "...###......",
+    "..######....",
+    ".....##.....",
+    "....##......",
+    "............",
+];
+const ICON_SNOW: Glyph = [
+    ".....##.....",
+    ".##..##..##.",
+    "..##.##.##..",
+    "...######...",
+    ".####..####.",
+    "...##..##...",
+    ".####..####.",
+    "...######...",
+    "..##.##.##..",
+    ".##..##..##.",
+    ".....##.....",
+    "............",
+];
+const ICON_MAGNET: Glyph = [
+    "............",
+    "..###..###..",
+    "..###..###..",
+    "..##....##..",
+    "..##....##..",
+    "..##....##..",
+    "..##....##..",
+    "...##..##...",
+    "....####....",
+    ".....##.....",
+    "............",
+    "............",
+];
+const ICON_BEACON: Glyph = [
+    ".....##.....",
+    "....####....",
+    "...##..##...",
+    "..#..##..#..",
+    ".....##.....",
+    ".....##.....",
+    ".....##.....",
+    "....####....",
+    "...######...",
+    "..########..",
+    "............",
+    "............",
+];
+const ICON_ORB: Glyph = [
+    "............",
+    "....####....",
+    "..########..",
+    "..########..",
+    ".####..####.",
+    ".####..####.",
+    "..########..",
+    "..########..",
+    "....####....",
+    "............",
+    "............",
+    "............",
+];
+const ICON_FLAG: Glyph = [
+    "..#.........",
+    "..########..",
+    "..########..",
+    "..#######...",
+    "..######....",
+    "..#.........",
+    "..#.........",
+    "..#.........",
+    "..#.........",
+    "..#.........",
+    "..#.........",
+    "............",
+];
+
+fn bake_icon(images: &mut Assets<Image>, glyph: Glyph) -> Handle<Image> {
+    let (w, h) = (12usize, 12usize);
+    let mut data = vec![0u8; w * h * 4];
+    for (y, row) in glyph.iter().enumerate() {
+        for (x, ch) in row.bytes().enumerate() {
+            let a = match ch {
+                b'#' => 255,
+                b'+' => 120,
+                _ => 0,
+            };
+            let i = (y * w + x) * 4;
+            data[i] = 255;
+            data[i + 1] = 255;
+            data[i + 2] = 255;
+            data[i + 3] = a;
+        }
+    }
+    let mut img = Image::new(
+        Extent3d {
+            width: w as u32,
+            height: h as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = ImageSampler::nearest();
+    images.add(img)
+}
+
+use bevy::asset::RenderAssetUsages;
+
+#[derive(Resource)]
+struct Icons {
+    gem: Handle<Image>,
+    home: Handle<Image>,
+    crate_: Handle<Image>,
+    speed: Handle<Image>,
+    bolt: Handle<Image>,
+    snow: Handle<Image>,
+    magnet: Handle<Image>,
+    beacon: Handle<Image>,
+    orb: Handle<Image>,
+    flag: Handle<Image>,
+}
+
+/// An icon as a UI node, tinted.
+fn icon(handle: &Handle<Image>, size: f32, tint: Color) -> impl Bundle {
+    (
+        ImageNode {
+            image: handle.clone(),
+            color: tint,
+            ..default()
+        },
+        Node {
+            width: Val::Px(size),
+            height: Val::Px(size),
+            ..default()
+        },
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Markers
@@ -37,9 +252,18 @@ struct CreditsText;
 #[derive(Component)]
 struct RangeText;
 #[derive(Component)]
+struct BestText;
+#[derive(Component)]
+struct SectorText;
+#[derive(Component)]
 struct SpeedText;
 #[derive(Component)]
-struct HoldText;
+struct HoldCountText;
+/// One of the three hold-content slots: the swatch square + its count text.
+#[derive(Component)]
+struct HoldSwatch(usize);
+#[derive(Component)]
+struct HoldSwatchText(usize);
 #[derive(Component)]
 struct TargetPanel;
 #[derive(Component)]
@@ -52,13 +276,24 @@ struct HeatBar;
 struct HeatBarFill;
 #[derive(Component)]
 struct HeatWarnText;
+/// Plasma pip circles, in order.
 #[derive(Component)]
-struct ChargePips;
+struct ChargePip(u32);
+#[derive(Component)]
+struct ChargeOverflowText;
 #[derive(Component)]
 struct ShopPanel;
-/// One purchasable line in the depot panel; index keys the updater.
 #[derive(Component)]
-struct ShopRow(usize);
+struct ShopName(usize);
+#[derive(Component)]
+struct ShopDot {
+    row: usize,
+    idx: u32,
+}
+#[derive(Component)]
+struct ShopPill(usize);
+#[derive(Component)]
+struct ShopPillText(usize);
 #[derive(Component)]
 struct StatusPanel;
 #[derive(Component)]
@@ -67,6 +302,8 @@ struct StatusText;
 struct ControlsText;
 #[derive(Component)]
 struct NavMarker;
+#[derive(Component)]
+struct NavDistText;
 
 /// World-anchored floating text. Lives on a UI Text node; the animate system
 /// projects `world_pos` to the screen each frame and fades it out.
@@ -85,7 +322,8 @@ impl Plugin for HudPlugin {
         app.add_systems(Startup, setup_hud).add_systems(
             Update,
             (
-                hud_top_bar,
+                hud_stats,
+                hud_hold,
                 hud_target,
                 hud_heat,
                 hud_shop,
@@ -106,56 +344,162 @@ fn font(size: f32) -> TextFont {
     }
 }
 
+fn chip_node() -> Node {
+    Node {
+        padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+        border: UiRect::all(Val::Px(1.5)),
+        align_items: AlignItems::Center,
+        column_gap: Val::Px(7.0),
+        border_radius: BorderRadius::all(Val::Px(9.0)),
+        ..default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------
 
-fn setup_hud(mut commands: Commands) {
-    // --- Top status bar -------------------------------------------------------
+fn setup_hud(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let icons = Icons {
+        gem: bake_icon(&mut images, ICON_GEM),
+        home: bake_icon(&mut images, ICON_HOME),
+        crate_: bake_icon(&mut images, ICON_CRATE),
+        speed: bake_icon(&mut images, ICON_SPEED),
+        bolt: bake_icon(&mut images, ICON_BOLT),
+        snow: bake_icon(&mut images, ICON_SNOW),
+        magnet: bake_icon(&mut images, ICON_MAGNET),
+        beacon: bake_icon(&mut images, ICON_BEACON),
+        orb: bake_icon(&mut images, ICON_ORB),
+        flag: bake_icon(&mut images, ICON_FLAG),
+    };
+
+    // --- Credits chip (top-left) ---------------------------------------------
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(10.0),
                 left: Val::Px(10.0),
-                right: Val::Px(10.0),
-                padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
-                border: UiRect::all(Val::Px(1.5)),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(18.0),
-                border_radius: BorderRadius::all(Val::Px(10.0)),
-                ..default()
+                ..chip_node()
             },
             BackgroundColor(PANEL_BG),
             BorderColor::all(PANEL_BORDER),
         ))
-        .with_children(|bar| {
-            bar.spawn((Text::new("0 cr"), font(24.0), TextColor(CREDITS), CreditsText));
-            bar.spawn((
-                Text::new(""),
-                font(16.0),
-                TextColor(TEXT_DIM),
-                RangeText,
-            ));
-            bar.spawn((Text::new(""), font(16.0), TextColor(CYAN), SpeedText));
+        .with_children(|c| {
+            c.spawn(icon(&icons.gem, 16.0, CREDITS));
+            c.spawn((Text::new("0"), font(22.0), TextColor(CREDITS), CreditsText));
         });
 
-    // --- Hold summary (bottom-left, above controls) ---------------------------
-    commands.spawn((
-        Text::new(""),
-        font(14.0),
-        TextColor(TEXT_DIM),
-        Node {
+    // --- Range / best / sector chip (top-center) ------------------------------
+    commands
+        .spawn(Node {
             position_type: PositionType::Absolute,
-            bottom: Val::Px(34.0),
-            left: Val::Px(12.0),
+            top: Val::Px(10.0),
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::Center,
             ..default()
-        },
-        HoldText,
-    ));
+        })
+        .with_children(|row| {
+            row.spawn((
+                chip_node(),
+                BackgroundColor(PANEL_BG),
+                BorderColor::all(PANEL_BORDER),
+            ))
+            .with_children(|c| {
+                c.spawn(icon(&icons.home, 15.0, TEXT_DIM));
+                c.spawn((Text::new("0m"), font(16.0), TextColor(TEXT_DIM), RangeText));
+                c.spawn(Node {
+                    width: Val::Px(10.0),
+                    ..default()
+                });
+                c.spawn(icon(&icons.flag, 14.0, TEXT_FAINT));
+                c.spawn((Text::new("0m"), font(16.0), TextColor(TEXT_FAINT), BestText));
+                c.spawn(Node {
+                    width: Val::Px(10.0),
+                    ..default()
+                });
+                // Sector badge: a bordered circle with the numeral inside.
+                c.spawn((
+                    Node {
+                        width: Val::Px(24.0),
+                        height: Val::Px(24.0),
+                        border: UiRect::all(Val::Px(1.5)),
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        border_radius: BorderRadius::all(Val::Px(12.0)),
+                        ..default()
+                    },
+                    BorderColor::all(CYAN),
+                    BackgroundColor(Color::srgba(0.05, 0.15, 0.20, 0.9)),
+                ))
+                .with_children(|b| {
+                    b.spawn((Text::new("I"), font(12.0), TextColor(CYAN), SectorText));
+                });
+            });
+        });
 
-    // --- Crosshair reticle (true center) ------------------------------------
+    // --- Speed chip (top-right) ------------------------------------------------
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                right: Val::Px(10.0),
+                ..chip_node()
+            },
+            BackgroundColor(PANEL_BG),
+            BorderColor::all(PANEL_BORDER),
+        ))
+        .with_children(|c| {
+            c.spawn(icon(&icons.speed, 15.0, CYAN));
+            c.spawn((Text::new("0.0"), font(18.0), TextColor(CYAN), SpeedText));
+        });
+
+    // --- Hold chip (bottom-left) -----------------------------------------------
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(12.0),
+                left: Val::Px(12.0),
+                ..chip_node()
+            },
+            BackgroundColor(PANEL_BG),
+            BorderColor::all(PANEL_BORDER),
+        ))
+        .with_children(|c| {
+            c.spawn(icon(&icons.crate_, 16.0, TEXT_DIM));
+            c.spawn((
+                Text::new("0"),
+                font(17.0),
+                TextColor(TEXT_DIM),
+                HoldCountText,
+            ));
+            for i in 0..3 {
+                c.spawn(Node {
+                    width: Val::Px(8.0),
+                    ..default()
+                });
+                c.spawn((
+                    Node {
+                        width: Val::Px(11.0),
+                        height: Val::Px(11.0),
+                        border_radius: BorderRadius::all(Val::Px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::NONE),
+                    HoldSwatch(i),
+                ));
+                c.spawn((
+                    Text::new(""),
+                    font(14.0),
+                    TextColor(TEXT_FAINT),
+                    HoldSwatchText(i),
+                ));
+            }
+        });
+
+    // --- Crosshair: four ticks + center dot -------------------------------------
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
@@ -166,27 +510,42 @@ fn setup_hud(mut commands: Commands) {
             ..default()
         })
         .with_children(|p| {
-            p.spawn((
-                Node {
-                    width: Val::Px(10.0),
-                    height: Val::Px(10.0),
-                    border: UiRect::all(Val::Px(2.0)),
-                    border_radius: BorderRadius::all(Val::Px(5.0)),
-                    ..default()
-                },
-                BorderColor::all(Color::srgba(0.7, 1.0, 1.0, 0.9)),
-            ));
+            p.spawn(Node {
+                width: Val::Px(28.0),
+                height: Val::Px(28.0),
+                ..default()
+            })
+            .with_children(|x| {
+                let tick = |x: &mut ChildSpawnerCommands, w: f32, h: f32, l: f32, t: f32| {
+                    x.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            width: Val::Px(w),
+                            height: Val::Px(h),
+                            left: Val::Px(l),
+                            top: Val::Px(t),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.7, 1.0, 1.0, 0.85)),
+                    ));
+                };
+                tick(x, 2.0, 7.0, 13.0, 0.0); // top
+                tick(x, 2.0, 7.0, 13.0, 21.0); // bottom
+                tick(x, 7.0, 2.0, 0.0, 13.0); // left
+                tick(x, 7.0, 2.0, 21.0, 13.0); // right
+                tick(x, 2.0, 2.0, 13.0, 13.0); // dot
+            });
         });
 
-    // --- Heat bar + charge pips (just under the reticle) ----------------------
+    // --- Heat bar + plasma pips (under the reticle) ------------------------------
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
-            top: Val::Percent(52.5),
+            top: Val::Percent(53.0),
             width: Val::Percent(100.0),
             flex_direction: FlexDirection::Column,
             align_items: AlignItems::Center,
-            row_gap: Val::Px(4.0),
+            row_gap: Val::Px(5.0),
             ..default()
         })
         .with_children(|col| {
@@ -222,19 +581,41 @@ fn setup_hud(mut commands: Commands) {
                 Visibility::Hidden,
                 HeatWarnText,
             ));
-            col.spawn((
-                Text::new(""),
-                font(13.0),
-                TextColor(Color::srgb(0.9, 0.4, 1.0)),
-                ChargePips,
-            ));
+            col.spawn(Node {
+                column_gap: Val::Px(4.0),
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|pips| {
+                for i in 0..10u32 {
+                    pips.spawn((
+                        Node {
+                            width: Val::Px(8.0),
+                            height: Val::Px(8.0),
+                            border: UiRect::all(Val::Px(1.0)),
+                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.9, 0.4, 1.0, 0.5)),
+                        BackgroundColor(Color::NONE),
+                        Visibility::Hidden,
+                        ChargePip(i),
+                    ));
+                }
+                pips.spawn((
+                    Text::new(""),
+                    font(13.0),
+                    TextColor(MAGENTA),
+                    ChargeOverflowText,
+                ));
+            });
         });
 
     // --- Target panel (below the heat cluster) --------------------------------
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
-            top: Val::Percent(58.5),
+            top: Val::Percent(59.0),
             width: Val::Percent(100.0),
             justify_content: JustifyContent::Center,
             ..default()
@@ -262,7 +643,6 @@ fn setup_hud(mut commands: Commands) {
                     TextColor(Color::WHITE),
                     TargetNameText,
                 ));
-                // HP bar: fixed track with a width-driven fill.
                 t.spawn((
                     Node {
                         width: Val::Px(190.0),
@@ -289,19 +669,28 @@ fn setup_hud(mut commands: Commands) {
             });
         });
 
-    // --- Depot panel (right, vertically centered, one row per item) -----------
+    // --- Depot panel: one row per item ------------------------------------------
+    let shop_icons = [
+        &icons.crate_, // sell
+        &icons.bolt,
+        &icons.snow,
+        &icons.magnet,
+        &icons.beacon,
+        &icons.orb,
+    ];
+    let shop_keys = ["E", "1", "2", "3", "4", "5"];
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Percent(50.0),
                 right: Val::Px(16.0),
-                margin: UiRect::top(Val::Px(-150.0)),
+                margin: UiRect::top(Val::Px(-160.0)),
                 flex_direction: FlexDirection::Column,
-                width: Val::Px(370.0),
+                width: Val::Px(390.0),
                 padding: UiRect::all(Val::Px(14.0)),
                 border: UiRect::all(Val::Px(1.5)),
-                row_gap: Val::Px(7.0),
+                row_gap: Val::Px(8.0),
                 border_radius: BorderRadius::all(Val::Px(10.0)),
                 ..default()
             },
@@ -311,9 +700,83 @@ fn setup_hud(mut commands: Commands) {
             ShopPanel,
         ))
         .with_children(|p| {
-            p.spawn((Text::new("◇ SUPPLY DEPOT"), font(20.0), TextColor(CYAN)));
-            for i in 0..6 {
-                p.spawn((Text::new(""), font(15.0), TextColor(TEXT_DIM), ShopRow(i)));
+            p.spawn((Text::new("SUPPLY DEPOT"), font(19.0), TextColor(CYAN)));
+            for (i, (ic, key)) in shop_icons.iter().zip(shop_keys).enumerate() {
+                p.spawn(Node {
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    // Key chip.
+                    row.spawn((
+                        Node {
+                            width: Val::Px(22.0),
+                            height: Val::Px(22.0),
+                            border: UiRect::all(Val::Px(1.0)),
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::Center,
+                            border_radius: BorderRadius::all(Val::Px(5.0)),
+                            ..default()
+                        },
+                        BorderColor::all(TEXT_FAINT),
+                        BackgroundColor(Color::srgba(0.10, 0.13, 0.18, 0.9)),
+                    ))
+                    .with_children(|k| {
+                        k.spawn((Text::new(key), font(12.0), TextColor(TEXT_DIM)));
+                    });
+                    row.spawn(icon(ic, 16.0, CYAN));
+                    row.spawn((
+                        Text::new(""),
+                        font(15.0),
+                        TextColor(TEXT_DIM),
+                        ShopName(i),
+                    ));
+                    // Level dots (rows 1..=3 use them).
+                    row.spawn(Node {
+                        column_gap: Val::Px(3.0),
+                        align_items: AlignItems::Center,
+                        flex_grow: 1.0,
+                        justify_content: JustifyContent::FlexEnd,
+                        ..default()
+                    })
+                    .with_children(|dots| {
+                        for d in 0..5u32 {
+                            dots.spawn((
+                                Node {
+                                    width: Val::Px(7.0),
+                                    height: Val::Px(7.0),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BorderColor::all(Color::srgba(0.4, 0.7, 0.8, 0.5)),
+                                BackgroundColor(Color::NONE),
+                                Visibility::Hidden,
+                                ShopDot { row: i, idx: d },
+                            ));
+                        }
+                    });
+                    // Cost pill.
+                    row.spawn((
+                        Node {
+                            padding: UiRect::axes(Val::Px(9.0), Val::Px(3.0)),
+                            border_radius: BorderRadius::all(Val::Px(9.0)),
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(PILL_NO_BG),
+                        ShopPill(i),
+                    ))
+                    .with_children(|pill| {
+                        pill.spawn((
+                            Text::new(""),
+                            font(14.0),
+                            TextColor(TOO_RICH),
+                            ShopPillText(i),
+                        ));
+                    });
+                });
             }
         });
 
@@ -349,32 +812,48 @@ fn setup_hud(mut commands: Commands) {
             });
         });
 
-    // --- Controls hint (bottom-left) ----------------------------------------
-    commands.spawn((
-        Text::new(""),
-        font(13.0),
-        TextColor(TEXT_FAINT),
-        Node {
+    // --- Controls hint: ONLY while unfocused ----------------------------------
+    commands
+        .spawn(Node {
             position_type: PositionType::Absolute,
-            bottom: Val::Px(10.0),
-            left: Val::Px(12.0),
+            bottom: Val::Px(40.0),
+            width: Val::Percent(100.0),
+            justify_content: JustifyContent::Center,
             ..default()
-        },
-        ControlsText,
-    ));
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(""),
+                font(14.0),
+                TextColor(TEXT_FAINT),
+                ControlsText,
+            ));
+        });
 
     // --- Depot nav marker (screen-space, repositioned every frame) ------------
-    commands.spawn((
-        Text::new("⌂"),
-        font(20.0),
-        TextColor(Color::srgba(0.45, 0.9, 1.0, 0.85)),
-        Node {
-            position_type: PositionType::Absolute,
-            ..default()
-        },
-        Visibility::Hidden,
-        NavMarker,
-    ));
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(1.0),
+                ..default()
+            },
+            Visibility::Hidden,
+            NavMarker,
+        ))
+        .with_children(|m| {
+            m.spawn(icon(&icons.home, 18.0, Color::srgba(0.45, 0.9, 1.0, 0.9)));
+            m.spawn((
+                Text::new(""),
+                font(12.0),
+                TextColor(Color::srgba(0.45, 0.9, 1.0, 0.8)),
+                NavDistText,
+            ));
+        });
+
+    commands.insert_resource(icons);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,42 +885,66 @@ fn roman(n: i32) -> String {
 }
 
 #[allow(clippy::type_complexity)]
-fn hud_top_bar(
+fn hud_stats(
     wallet: Res<Wallet>,
-    inventory: Res<Inventory>,
     player: Res<PlayerState>,
     mut q: ParamSet<(
         Query<&mut Text, With<CreditsText>>,
         Query<&mut Text, With<RangeText>>,
+        Query<&mut Text, With<BestText>>,
+        Query<&mut Text, With<SectorText>>,
         Query<&mut Text, With<SpeedText>>,
-        Query<&mut Text, With<HoldText>>,
     )>,
 ) {
     if let Ok(mut t) = q.p0().single_mut() {
-        t.0 = format!("{} cr", commas(wallet.credits));
+        t.0 = commas(wallet.credits);
     }
     if let Ok(mut t) = q.p1().single_mut() {
-        let sector = (player.range_m() / TIER_M) as i32 + 1;
-        t.0 = format!(
-            "RANGE {:.0} m   ·   BEST {:.0} m   ·   SECTOR {}",
-            player.range_m(),
-            player.max_range,
-            roman(sector),
-        );
+        t.0 = format!("{:.0}m", player.range_m());
     }
     if let Ok(mut t) = q.p2().single_mut() {
-        t.0 = format!("{:5.1} m/s", player.vel.length());
+        t.0 = format!("{:.0}m", player.max_range);
     }
     if let Ok(mut t) = q.p3().single_mut() {
-        let mut s = format!(
-            "HOLD  {} units  ({} cr)",
-            inventory.units,
-            commas(inventory.total_value())
-        );
-        for (&(id, tier), &count) in inventory.stacks.iter().rev().take(3) {
-            s.push_str(&format!("   ·  {} ×{}", loot_name(id, tier), count));
-        }
-        t.0 = s;
+        t.0 = roman((player.range_m() / TIER_M) as i32 + 1);
+    }
+    if let Ok(mut t) = q.p4().single_mut() {
+        t.0 = format!("{:.1}", player.vel.length());
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn hud_hold(
+    inventory: Res<Inventory>,
+    mut count_q: Query<&mut Text, (With<HoldCountText>, Without<HoldSwatchText>)>,
+    mut swatches: Query<(&HoldSwatch, &mut BackgroundColor)>,
+    mut swatch_texts: Query<(&HoldSwatchText, &mut Text), Without<HoldCountText>>,
+) {
+    if let Ok(mut t) = count_q.single_mut() {
+        t.0 = format!("{} · {}", inventory.units, commas(inventory.total_value()));
+    }
+    // Top three stacks as color swatches + counts.
+    let top: Vec<((u8, i32), u32)> = inventory
+        .stacks
+        .iter()
+        .rev()
+        .take(3)
+        .map(|(&k, &v)| (k, v))
+        .collect();
+    for (sw, mut bg) in &mut swatches {
+        bg.0 = match top.get(sw.0) {
+            Some(&((id, tier), _)) => {
+                let c = loot_color(id, tier);
+                Color::linear_rgb(c[0] * 1.6, c[1] * 1.6, c[2] * 1.6)
+            }
+            None => Color::NONE,
+        };
+    }
+    for (st, mut text) in &mut swatch_texts {
+        text.0 = match top.get(st.0) {
+            Some(&(_, count)) => format!("{count}"),
+            None => String::new(),
+        };
     }
 }
 
@@ -464,7 +967,7 @@ fn hud_target(
         name.0 = if t.indestructible {
             format!("{} — impervious", t.name)
         } else if t.value > 0 {
-            format!("{}   ({} cr)", t.name, commas(t.value))
+            format!("{}  ({} cr)", t.name, commas(t.value))
         } else {
             t.name.clone()
         };
@@ -475,7 +978,6 @@ fn hud_target(
         color.0 = if t.indestructible {
             Color::srgb(0.5, 0.55, 0.62)
         } else {
-            // Cool cyan when healthy, white-hot as it nears breaking.
             Color::srgb(0.3 + (1.0 - frac) * 0.7, 0.85, 0.95)
         };
     }
@@ -485,10 +987,11 @@ fn hud_target(
 fn hud_heat(
     laser: Res<LaserState>,
     upgrades: Res<Upgrades>,
-    mut bar_q: Query<&mut Visibility, (With<HeatBar>, Without<HeatWarnText>)>,
+    mut bar_q: Query<&mut Visibility, (With<HeatBar>, Without<HeatWarnText>, Without<ChargePip>)>,
     mut fill_q: Query<(&mut Node, &mut BackgroundColor), With<HeatBarFill>>,
-    mut warn_q: Query<&mut Visibility, (With<HeatWarnText>, Without<HeatBar>)>,
-    mut pips_q: Query<&mut Text, With<ChargePips>>,
+    mut warn_q: Query<&mut Visibility, (With<HeatWarnText>, Without<HeatBar>, Without<ChargePip>)>,
+    mut pips: Query<(&ChargePip, &mut Visibility, &mut BackgroundColor), (Without<HeatBar>, Without<HeatWarnText>, Without<HeatBarFill>)>,
+    mut overflow_q: Query<&mut Text, With<ChargeOverflowText>>,
 ) {
     if let Ok(mut vis) = bar_q.single_mut() {
         *vis = if laser.heat > 0.02 {
@@ -499,7 +1002,6 @@ fn hud_heat(
     }
     if let Ok((mut node, mut color)) = fill_q.single_mut() {
         node.width = Val::Percent(laser.heat * 100.0);
-        // Cyan -> amber -> red as heat builds.
         let h = laser.heat;
         color.0 = if laser.locked {
             Color::srgb(1.0, 0.3, 0.2)
@@ -516,16 +1018,32 @@ fn hud_heat(
             Visibility::Hidden
         };
     }
-    if let Ok(mut pips) = pips_q.single_mut() {
-        let n = upgrades.charges.min(10) as usize;
-        let mut s = String::with_capacity(24);
-        for _ in 0..n {
-            s.push('◆');
-        }
-        if upgrades.charges > 10 {
-            s.push_str(&format!(" +{}", upgrades.charges - 10));
-        }
-        pips.0 = s;
+    let n = upgrades.charges;
+    for (pip, mut vis, mut bg) in &mut pips {
+        *vis = if pip.0 < n.min(10) {
+            Visibility::Visible
+        } else if pip.0 < 10 && n < 10 {
+            // Show empty sockets up to a soft max so the row reads as a gauge.
+            if pip.0 < 5 {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            }
+        } else {
+            Visibility::Hidden
+        };
+        bg.0 = if pip.0 < n {
+            MAGENTA
+        } else {
+            Color::NONE
+        };
+    }
+    if let Ok(mut t) = overflow_q.single_mut() {
+        t.0 = if n > 10 {
+            format!("+{}", n - 10)
+        } else {
+            String::new()
+        };
     }
 }
 
@@ -534,8 +1052,11 @@ fn hud_shop(
     wallet: Res<Wallet>,
     inventory: Res<Inventory>,
     upgrades: Res<Upgrades>,
-    mut panel_q: Query<&mut Visibility, With<ShopPanel>>,
-    mut rows: Query<(&ShopRow, &mut Text, &mut TextColor)>,
+    mut panel_q: Query<&mut Visibility, (With<ShopPanel>, Without<ShopDot>)>,
+    mut names: Query<(&ShopName, &mut Text), Without<ShopPillText>>,
+    mut dots: Query<(&ShopDot, &mut Visibility, &mut BackgroundColor), Without<ShopPanel>>,
+    mut pills: Query<(&ShopPill, &mut BackgroundColor), (Without<ShopDot>, Without<ShopPanel>)>,
+    mut pill_texts: Query<(&ShopPillText, &mut Text, &mut TextColor), Without<ShopName>>,
 ) {
     let Ok(mut vis) = panel_q.single_mut() else {
         return;
@@ -546,72 +1067,72 @@ fn hud_shop(
     }
     *vis = Visibility::Visible;
 
-    for (row, mut text, mut color) in &mut rows {
-        let (line, affordable) = match row.0 {
-            0 => (
-                format!("[E]  Sell hold    +{} cr", commas(inventory.total_value())),
-                inventory.units > 0,
-            ),
-            1 => {
-                let cost = upgrades.power_cost();
-                (
-                    format!(
-                        "[1]  Laser output   {:.0} → {:.0} DPS    {} cr",
-                        upgrades.dps(),
-                        upgrades.dps() * 1.5,
-                        commas(cost)
-                    ),
-                    wallet.credits >= cost,
-                )
-            }
-            2 => {
-                let cost = upgrades.coolant_cost();
-                (
-                    format!(
-                        "[2]  Coolant loop   lv{}    {} cr",
-                        upgrades.coolant_lvl + 1,
-                        commas(cost)
-                    ),
-                    wallet.credits >= cost,
-                )
-            }
-            3 => {
-                let cost = upgrades.tractor_cost();
-                (
-                    format!(
-                        "[3]  Tractor field   {:.1} → {:.1} m    {} cr",
-                        upgrades.magnet_range(),
-                        upgrades.magnet_range() + 0.8,
-                        commas(cost)
-                    ),
-                    wallet.credits >= cost,
-                )
-            }
-            4 => {
-                if upgrades.recall {
-                    ("[4]  Recall rig — OWNED".to_string(), false)
+    // (name, level for dots (None = no dots), cost text, affordable)
+    let rows: [(String, Option<u32>, String, bool); 6] = [
+        (
+            "Sell hold".into(),
+            None,
+            format!("+{}", commas(inventory.total_value())),
+            inventory.units > 0,
+        ),
+        (
+            format!("Laser  {:.0} DPS", upgrades.dps()),
+            Some(upgrades.power_lvl),
+            commas(upgrades.power_cost()),
+            wallet.credits >= upgrades.power_cost(),
+        ),
+        (
+            "Coolant loop".into(),
+            Some(upgrades.coolant_lvl),
+            commas(upgrades.coolant_cost()),
+            wallet.credits >= upgrades.coolant_cost(),
+        ),
+        (
+            format!("Tractor  {:.1}m", upgrades.magnet_range()),
+            Some(upgrades.tractor_lvl),
+            commas(upgrades.tractor_cost()),
+            wallet.credits >= upgrades.tractor_cost(),
+        ),
+        (
+            "Recall rig".into(),
+            None,
+            if upgrades.recall {
+                "OWNED".into()
+            } else {
+                commas(RECALL_COST)
+            },
+            !upgrades.recall && wallet.credits >= RECALL_COST,
+        ),
+        (
+            format!("Plasma ×{}", crate::game::PLASMA_PACK_SIZE),
+            None,
+            commas(upgrades.plasma_cost()),
+            wallet.credits >= upgrades.plasma_cost(),
+        ),
+    ];
+
+    for (name, mut text) in &mut names {
+        text.0 = rows[name.0].0.clone();
+    }
+    for (dot, mut vis, mut bg) in &mut dots {
+        match rows[dot.row].1 {
+            Some(lvl) => {
+                *vis = Visibility::Visible;
+                bg.0 = if dot.idx < lvl.min(5) {
+                    CYAN
                 } else {
-                    (
-                        format!("[4]  Recall rig    {} cr", commas(RECALL_COST)),
-                        wallet.credits >= RECALL_COST,
-                    )
-                }
+                    Color::NONE
+                };
             }
-            _ => {
-                let cost = upgrades.plasma_cost();
-                (
-                    format!(
-                        "[5]  Plasma charges ×{}    {} cr    (held {})",
-                        crate::game::PLASMA_PACK_SIZE,
-                        commas(cost),
-                        upgrades.charges
-                    ),
-                    wallet.credits >= cost,
-                )
-            }
-        };
-        text.0 = line;
-        color.0 = if affordable { AFFORD } else { TOO_RICH };
+            None => *vis = Visibility::Hidden,
+        }
+    }
+    for (pill, mut bg) in &mut pills {
+        bg.0 = if rows[pill.0].3 { PILL_OK_BG } else { PILL_NO_BG };
+    }
+    for (pt, mut text, mut color) in &mut pill_texts {
+        text.0 = rows[pt.0].2.clone();
+        color.0 = if rows[pt.0].3 { AFFORD } else { TOO_RICH };
     }
 }
 
@@ -633,34 +1154,30 @@ fn hud_status(
     }
 }
 
-fn hud_controls(
-    focused: Res<Focused>,
-    upgrades: Res<Upgrades>,
-    mut q: Query<&mut Text, With<ControlsText>>,
-) {
+/// Full control reference only while the cursor is free; in play, the screen
+/// belongs to the game.
+fn hud_controls(focused: Res<Focused>, mut q: Query<&mut Text, With<ControlsText>>) {
     let Ok(mut text) = q.single_mut() else { return };
     text.0 = if !focused.0 {
-        "Click to take the controls".to_string()
-    } else if upgrades.recall {
-        "WASD thrust · Space up · C down · Shift brake · LMB laser · Q charge · T home · G far site · Esc release"
+        "Click to take the controls\nWASD thrust · Space up · C down · Shift brake · LMB laser · Q charge · E trade · T/G recall · Esc release"
             .to_string()
     } else {
-        "WASD thrust · Space up · C down · Shift brake · LMB laser · Q charge · Esc release"
-            .to_string()
+        String::new()
     };
 }
 
-/// Point home: a ⌂ marker pinned to the depot, clamped to the screen edge
-/// when it's off-camera. Hidden once you're close enough to see the pad.
+/// Point home: the home icon pinned toward the depot, clamped to the screen
+/// edge when it's off-camera. Hidden once you're close enough to see the pad.
 fn hud_nav_marker(
     player: Res<PlayerState>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
-    mut markers: Query<(&mut Node, &mut Visibility, &mut Text), With<NavMarker>>,
+    mut markers: Query<(&mut Node, &mut Visibility), With<NavMarker>>,
+    mut dist_q: Query<&mut Text, With<NavDistText>>,
 ) {
     let Ok((camera, cam_tf)) = cameras.single() else {
         return;
     };
-    let Ok((mut node, mut vis, mut text)) = markers.single_mut() else {
+    let Ok((mut node, mut vis)) = markers.single_mut() else {
         return;
     };
     let target = shop_pos() + Vec3::Y * 1.5;
@@ -670,7 +1187,9 @@ fn hud_nav_marker(
         return;
     }
     *vis = Visibility::Visible;
-    text.0 = format!("⌂ {:.0}m", dist);
+    if let Ok(mut t) = dist_q.single_mut() {
+        t.0 = format!("{:.0}m", dist);
+    }
 
     let Some(view_size) = camera.logical_viewport_size() else {
         return;
@@ -680,13 +1199,10 @@ fn hud_nav_marker(
 
     match camera.world_to_viewport(cam_tf, target) {
         Ok(screen) => {
-            // On screen (or near it): clamp into the visible frame.
             node.left = Val::Px(screen.x.clamp(margin, view_size.x - margin));
             node.top = Val::Px(screen.y.clamp(margin, view_size.y - margin));
         }
         Err(_) => {
-            // Behind the camera: project the direction into view space and
-            // pin the marker to the screen edge it's closest to.
             let local = cam_tf.affine().inverse().transform_point3(target);
             let dir2 = Vec2::new(local.x, -local.y).normalize_or_zero();
             let pos = center + dir2 * (center.min_element() - margin);
@@ -717,7 +1233,6 @@ pub fn spawn_float_text(
             position_type: PositionType::Absolute,
             ..default()
         },
-        // Starts off-screen; the animate system places it on the first frame.
         FloatText {
             world_pos,
             age: 0.0,
@@ -761,17 +1276,14 @@ fn animate_float_text(
             commands.entity(entity).despawn();
             continue;
         }
-        // Drift upward in world space, then project to the screen.
         let world = ft.world_pos + Vec3::Y * (t * ft.rise);
         match camera.world_to_viewport(cam_tf, world) {
             Ok(screen) => {
                 node.left = Val::Px(screen.x);
                 node.top = Val::Px(screen.y);
-                // Ease-out fade; full opacity for the first third of life.
                 let alpha = (1.0 - (t - 0.33).max(0.0) / 0.67).clamp(0.0, 1.0);
                 color.0 = color.0.with_alpha(alpha);
             }
-            // Behind the camera or off-target: hide this frame.
             Err(_) => color.0 = color.0.with_alpha(0.0),
         }
     }

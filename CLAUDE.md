@@ -9,13 +9,14 @@ A Bevy 0.18 incremental space-mining game: first-person **zero-G laser mining in
 - Every destroyed voxel drops physical loot that tractor-beams to you in range; crystals glow in the walls (tier 0 "Carbon" is deliberately modest — colors get loud further out). Asteroids are richer toward their centers and have a pure-crystal core.
 - **Q** throws a plasma charge: 2s fuse, carves a 4m sphere, loot arrives as *stacked* drops. You start with 2; more at the depot.
 - **E** at the depot pad sells the hold; **1/2/3/4/5** buy laser power / coolant loop / tractor field / recall rig / plasma charges. **T** recalls home, **G** jumps back to your farthest-reached site (after buying recall).
-- HUD: top status bar (credits · range/best/sector · speed), reticle + heat bar + charge pips, target HP panel, per-row depot panel with affordability colors, status toast, hold summary, and a **⌂ nav marker** that pins the depot to the screen edge when it's off-camera.
+- HUD is graphical, not textual: procedurally-baked 12x12 **pixel icons** (no asset files; see the `Glyph` constants in `hud.rs`), stat chips (credits / range·best·sector / speed), heat bar + plasma pip circles, loot-color swatches in the hold chip, a depot panel of key-chips + icons + level dots + cost pills, and a home-icon nav marker pinned to the screen edge when the depot is off-camera. The controls reference only renders while the cursor is free. Numbers stay text; prose labels don't.
 - The whole progression curve (HP/value/cost growth factors) lives in the constants at the top of `src/game.rs` and `src/world.rs`.
 
 ## Architecture notes
 
 - World: an unbounded 3D asteroid field, chunked 16³ in all directions. A deterministic hash gives each 56m cell at most one asteroid (lumpy fbm-displaced sphere, regolith shell, ore odds rising toward a crystal core); the home rock sits at the origin. Worldgen is a pure function of voxel coords (`world::block_at`); chunks store one byte per voxel.
 - Chunk streaming: chunks materialize nearest-first within ~56m of the player (budgeted per frame) and unload behind them. Pure-vacuum chunks cost a set entry, never storage/entities. **Player edits live in a sparse overlay** that survives unload and is re-applied on regeneration (this is also exactly what a save file would serialize). `VoxelWorld::block()` falls back to pure worldgen + edits for unmaterialized chunks, so collision/raycasts are correct anywhere. A test asserts chunk contents always equal pure gen.
+- Far-field LOD (`lod.rs`): every asteroid out to ~520m gets an **impostor** — a ~160-vert ico-sphere displaced by the same `surface_toward` noise the voxel gen uses, vertex-colored to the tier palette. Built lazily a few per frame, despawned far behind, and hidden when the player is within 40m (by which point the real chunks are streamed in — matched silhouettes make the swap hard to spot). This is what makes the view distance read as near-infinite; never raise raw chunk GEN_RADIUS for visibility.
 - Lighting: no shadow maps. An upward-ray **Enclosure** probe (smoothed) fades sun + ambient when you're inside rock, and drives the helmet lamp the *opposite* way (dim in daylight, bright in tunnels — they never stack). A weak cool anti-sun fill keeps shadow-side voxel faces from being void-black stripes against space.
 - Rendering: **two** naive-culled meshes per chunk, vertex-colored (no block textures): a lit mesh for rock, and an unlit mesh whose vertex colors run >1.0 for crystal faces — the HDR camera + bloom turn those into glowing ore veins. Remeshed on demand with a per-frame budget.
 - The camera carries `Hdr` + `Bloom` + `Tonemapping::TonyMcMapface` (inserted by `sky.rs` in PostStartup). Every glow in the game — laser beam, crystals, sun, depot beacon, sparks — is just an unlit material with linear color >1.0 feeding that bloom pass. Keep light intensities modest: a spotlight concentrates lumens ~10x vs a point light and will white-disc any close wall.
@@ -97,6 +98,7 @@ src/
   hud.rs     Top bar, reticle + heat + pips, target panel, depot rows, nav marker,
              float text (HudPlugin)
   sky.rs     Starfield cubemap, HDR camera setup, SkyAnchor celestials, dust (SkyPlugin)
+  lod.rs     Far-asteroid impostor meshes — near-infinite view distance (LodPlugin)
   audio.rs   Procedural WAV synthesis, SfxQueue, laser/jet/ambient loops (SoundPlugin)
   demo.rs    LIMITS_DEMO scripted tour + screenshots — hands-off verification (DemoPlugin)
 .cargo/
