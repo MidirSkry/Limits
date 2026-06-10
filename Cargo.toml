@@ -11,7 +11,10 @@ default = []
 dev = ["bevy/dynamic_linking"]
 
 [dependencies]
-bevy = "0.18.1"
+# `wav`: we synthesize all SFX at startup as in-memory WAV buffers (no asset
+# files); rodio needs the wav decoder. `tonemapping_luts`: TonyMcMapface for
+# the HDR/bloom space look.
+bevy = { version = "0.18.1", features = ["wav", "tonemapping_luts"] }
 
 # Optimize our own crate lightly so debug-build runtime is bearable at 100k+ entities,
 # and optimize all dependencies (including Bevy) fully — this is the standard Bevy

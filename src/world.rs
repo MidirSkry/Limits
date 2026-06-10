@@ -1,14 +1,19 @@
 //! Voxel world: storage, procedural generation, chunk meshing, and raycasting.
 //!
-//! Design: the world is a fixed 48x48-voxel mining claim (24m x 24m at 0.5m
-//! voxels) that extends downward indefinitely. Chunks are 16^3 voxels, generated
-//! lazily as the player descends. Each voxel is one byte (block id); block
-//! stats (HP, value, color, name) are pure functions of (id, depth) so deeper
-//! layers get harder and richer without storing anything per voxel.
+//! Design: the world is a fixed 96x96-voxel mining claim (24m x 24m at 0.25m
+//! voxels) sunk into the surface of a very large asteroid, extending downward
+//! indefinitely. Chunks are 16^3 voxels, generated lazily as the player
+//! descends. Each voxel is one byte (block id); block stats (HP, value, color,
+//! name) are pure functions of (id, depth) so deeper strata get harder and
+//! richer without storing anything per voxel.
+//!
+//! Each chunk renders as TWO meshes: a lit, vertex-colored mesh for ordinary
+//! rock, and an unlit mesh whose vertex colors run hot (>1.0) for crystal
+//! faces — with the HDR camera + bloom that makes ore veins glow in the dark.
 
 use bevy::asset::RenderAssetUsages;
-use bevy::prelude::*;
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
@@ -25,13 +30,13 @@ pub const WORLD_VOXELS_XZ: i32 = CHUNK * WORLD_CHUNKS_XZ;
 
 /// Rim wall height above the surface (voxels) so you can't walk off the claim.
 const WALL_TOP: i32 = 6;
-/// Topsoil thickness (layers) before rock starts.
-const SOIL_LAYERS: i32 = 8;
+/// Loose regolith thickness (layers) before solid rock starts.
+const REGOLITH_LAYERS: i32 = 8;
 /// Layers per difficulty band (16m). Each band doubles block HP and ~2.4x's ore value.
 pub const BAND_LAYERS: i32 = 64;
-/// Chance for a buried block to be ore instead of rock.
+/// Chance for a buried block to be crystal instead of rock.
 const ORE_CHANCE: f32 = 0.05;
-/// No ore in the first couple of meters — forces an early "sell cheap coal" loop.
+/// No crystal in the first couple of meters — forces an early "sell cheap carbon" loop.
 const ORE_MIN_DEPTH: i32 = 10;
 
 /// How many voxels below the player's feet we keep generated (20m).
@@ -45,38 +50,39 @@ const REMESH_BUDGET: usize = 12;
 
 pub const AIR: u8 = 0;
 pub const BARRIER: u8 = 1;
-pub const SOIL: u8 = 2;
+pub const REGOLITH: u8 = 2;
 pub const ROCK: u8 = 3;
 pub const ORE: u8 = 4;
 
 const ROCK_NAMES: [&str; 8] = [
-    "Stone", "Slate", "Granite", "Basalt", "Marble", "Obsidian", "Deepstone", "Voidrock",
+    "Chondrite", "Basalt", "Magnetite", "Hematite", "Pallasite", "Obsidian", "Deepcore",
+    "Voidrock",
 ];
 const ORE_NAMES: [&str; 8] = [
-    "Coal", "Copper", "Iron", "Silver", "Gold", "Ruby", "Sapphire", "Mythril",
+    "Carbon", "Ferrite", "Cobalt", "Titania", "Argent", "Aurium", "Cryonite", "Stellarite",
 ];
 
 // Linear-RGB palettes, cycled per band. Vertex colors multiply the material's
 // white base color, so these are the on-screen block colors.
 const ROCK_COLORS: [[f32; 3]; 8] = [
-    [0.45, 0.45, 0.47], // Stone
-    [0.35, 0.37, 0.42], // Slate
-    [0.50, 0.42, 0.40], // Granite
-    [0.25, 0.24, 0.26], // Basalt
-    [0.62, 0.60, 0.58], // Marble
-    [0.13, 0.10, 0.18], // Obsidian
-    [0.20, 0.26, 0.30], // Deepstone
-    [0.30, 0.14, 0.30], // Voidrock
+    [0.38, 0.36, 0.34], // Chondrite — dusty grey-brown
+    [0.26, 0.26, 0.29], // Basalt — dark blue-grey
+    [0.33, 0.30, 0.36], // Magnetite — purple-grey
+    [0.42, 0.30, 0.26], // Hematite — rust
+    [0.45, 0.42, 0.34], // Pallasite — olive metal
+    [0.12, 0.10, 0.16], // Obsidian — near-black violet
+    [0.18, 0.24, 0.28], // Deepcore — cold teal-grey
+    [0.28, 0.13, 0.28], // Voidrock — bruised purple
 ];
 const ORE_COLORS: [[f32; 3]; 8] = [
-    [0.10, 0.10, 0.10], // Coal
-    [0.75, 0.45, 0.20], // Copper
-    [0.70, 0.65, 0.60], // Iron
-    [0.85, 0.85, 0.90], // Silver
-    [0.95, 0.78, 0.20], // Gold
-    [0.85, 0.10, 0.15], // Ruby
-    [0.15, 0.30, 0.90], // Sapphire
-    [0.30, 0.90, 0.70], // Mythril
+    [0.55, 0.48, 0.34], // Carbon — warm amber glint
+    [0.95, 0.45, 0.15], // Ferrite — ember orange
+    [0.25, 0.45, 1.00], // Cobalt — electric blue
+    [0.90, 0.90, 0.95], // Titania — white
+    [0.75, 0.85, 1.00], // Argent — ice blue
+    [1.00, 0.78, 0.20], // Aurium — gold
+    [0.20, 0.95, 0.90], // Cryonite — cyan
+    [0.95, 0.30, 0.85], // Stellarite — magenta
 ];
 
 /// Depth layer of a voxel: surface layer (v.y == -1) is depth 0.
@@ -91,12 +97,10 @@ pub fn band_of_depth(depth: i32) -> i32 {
 }
 
 /// Max HP for a block. Doubles per band — the incremental difficulty wall.
-/// Smaller cubes mean ~4.5x more blocks per meter of shaft than the old 0.5m
-/// build, so per-block HP is roughly halved to keep dig-time-per-meter sane.
 pub fn block_hp(id: u8, depth: i32) -> f32 {
     let b = band_of_depth(depth);
     match id {
-        SOIL => 3.0,
+        REGOLITH => 3.0,
         ROCK => 6.0 * 2.0f32.powi(b),
         ORE => 12.0 * 2.0f32.powi(b),
         BARRIER => f32::INFINITY,
@@ -104,7 +108,7 @@ pub fn block_hp(id: u8, depth: i32) -> f32 {
     }
 }
 
-/// Sale value of one ore from the given band. Grows faster than HP (2.4x vs
+/// Sale value of one crystal from the given band. Grows faster than HP (2.4x vs
 /// 2.0x) so net progression accelerates as you push deeper.
 pub fn ore_value(band: i32) -> u64 {
     (10.0 * 2.4f64.powi(band)).round() as u64
@@ -131,28 +135,23 @@ pub fn rock_name(band: i32) -> String {
 
 pub fn block_display_name(id: u8, depth: i32) -> String {
     match id {
-        SOIL => {
-            if depth == 0 {
-                "Grass".to_string()
-            } else {
-                "Dirt".to_string()
-            }
-        }
+        REGOLITH => "Regolith".to_string(),
         ROCK => rock_name(band_of_depth(depth)),
-        ORE => ore_name(band_of_depth(depth)),
-        BARRIER => "Bedrock".to_string(),
+        ORE => format!("{} Crystal", ore_name(band_of_depth(depth))),
+        BARRIER => "Dense Core".to_string(),
         _ => String::new(),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Loot — every destroyed voxel drops something. Junk sells for $1 at band 0;
-// rock value doubles per band so deep spoil isn't pure trash; ore is the prize.
+// Loot — every destroyed voxel drops something. Spoil sells for scraps at band
+// 0; rock value doubles per band so deep spoil isn't pure trash; crystal is the
+// prize.
 // ---------------------------------------------------------------------------
 
 pub fn loot_value(id: u8, band: i32) -> u64 {
     match id {
-        SOIL => 1,
+        REGOLITH => 1,
         ROCK => 1u64 << band.clamp(0, 40),
         ORE => ore_value(band),
         _ => 0,
@@ -161,7 +160,7 @@ pub fn loot_value(id: u8, band: i32) -> u64 {
 
 pub fn loot_name(id: u8, band: i32) -> String {
     match id {
-        SOIL => "Dirt".to_string(),
+        REGOLITH => "Regolith".to_string(),
         ROCK => rock_name(band),
         ORE => ore_name(band),
         _ => String::new(),
@@ -172,7 +171,7 @@ pub fn loot_name(id: u8, band: i32) -> String {
 pub fn loot_color(id: u8, band: i32) -> [f32; 3] {
     let b = band.max(0) as usize;
     match id {
-        SOIL => [0.42, 0.30, 0.18],
+        REGOLITH => [0.40, 0.37, 0.33],
         ROCK => ROCK_COLORS[b % ROCK_COLORS.len()],
         ORE => ORE_COLORS[b % ORE_COLORS.len()],
         _ => [1.0, 0.0, 1.0],
@@ -217,8 +216,8 @@ pub fn block_at(v: IVec3) -> u8 {
             return BARRIER;
         }
         let d = depth_of(v);
-        if d < SOIL_LAYERS {
-            SOIL
+        if d < REGOLITH_LAYERS {
+            REGOLITH
         } else if d >= ORE_MIN_DEPTH && hash_unit(v, 0xA17E) < ORE_CHANCE {
             ORE
         } else {
@@ -233,16 +232,16 @@ fn block_color(id: u8, v: IVec3) -> [f32; 3] {
     let d = depth_of(v);
     let b = band_of_depth(d) as usize;
     let base = match id {
-        SOIL => {
+        REGOLITH => {
             if d == 0 {
-                [0.25, 0.50, 0.16] // grass
+                [0.37, 0.355, 0.33] // sun-bleached surface dust
             } else {
-                [0.42, 0.30, 0.18] // dirt
+                [0.30, 0.275, 0.25] // packed regolith
             }
         }
         ROCK => ROCK_COLORS[b % ROCK_COLORS.len()],
         ORE => ORE_COLORS[b % ORE_COLORS.len()],
-        BARRIER => [0.10, 0.10, 0.11],
+        BARRIER => [0.09, 0.10, 0.12],
         _ => [1.0, 0.0, 1.0],
     };
     let j = 0.85 + 0.15 * hash_unit(v, 0xC0102);
@@ -359,8 +358,10 @@ impl VoxelWorld {
 pub struct RayHit {
     pub voxel: IVec3,
     /// Unit-axis normal of the face that was hit (points back toward the ray).
-    #[allow(dead_code)]
     pub normal: IVec3,
+    /// Ray parameter (world units) at the hit — origin + dir * t is the
+    /// point on the struck face. Used to land the laser beam exactly.
+    pub t: f32,
 }
 
 pub fn raycast(world: &VoxelWorld, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RayHit> {
@@ -393,7 +394,11 @@ pub fn raycast(world: &VoxelWorld, origin: Vec3, dir: Vec3, max_dist: f32) -> Op
     let mut t = 0.0f32;
     while t <= max_t {
         if world.solid(cell) {
-            return Some(RayHit { voxel: cell, normal });
+            return Some(RayHit {
+                voxel: cell,
+                normal,
+                t: t * VOXEL,
+            });
         }
         if t_max.x <= t_max.y && t_max.x <= t_max.z {
             t = t_max.x;
@@ -425,7 +430,8 @@ fn axis_t(p: f32, cell: i32, step: i32, inv: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Meshing — naive face culling, one mesh per chunk, verts in world space.
+// Meshing — naive face culling, two meshes per chunk (lit rock + unlit glow),
+// verts in world space.
 // ---------------------------------------------------------------------------
 
 // Per-face corner offsets (CCW from outside) + normal + baked shade factor.
@@ -476,12 +482,55 @@ const FACES: [Face; 6] = [
     },
 ];
 
-pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> Mesh {
+struct MeshScratch {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+}
+
+impl MeshScratch {
+    fn new() -> Self {
+        Self {
+            positions: Vec::with_capacity(4096),
+            normals: Vec::with_capacity(4096),
+            colors: Vec::with_capacity(4096),
+            indices: Vec::with_capacity(6144),
+        }
+    }
+
+    fn push_face(&mut self, base: Vec3, face: &Face, color: [f32; 4]) {
+        let i0 = self.positions.len() as u32;
+        for c in &face.corners {
+            self.positions.push([
+                base.x + c[0] * VOXEL,
+                base.y + c[1] * VOXEL,
+                base.z + c[2] * VOXEL,
+            ]);
+            self.normals.push(face.normal);
+            self.colors.push(color);
+        }
+        self.indices
+            .extend_from_slice(&[i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3]);
+    }
+
+    fn into_mesh(self) -> Mesh {
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+        .with_inserted_indices(Indices::U32(self.indices))
+    }
+}
+
+/// Build both meshes for a chunk: (lit rock mesh, unlit HDR crystal-glow mesh).
+pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
     // Event-driven (not per-frame-hot): a few transient Vecs per remesh is fine.
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(4096);
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(4096);
-    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(4096);
-    let mut indices: Vec<u32> = Vec::with_capacity(6144);
+    let mut solid = MeshScratch::new();
+    let mut glow = MeshScratch::new();
 
     let origin = cp * CHUNK;
     for y in 0..CHUNK {
@@ -498,43 +547,40 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> Mesh {
                     if world.solid(v + face.dir) {
                         continue;
                     }
-                    let s = face.shade;
-                    let i0 = positions.len() as u32;
-                    for c in &face.corners {
-                        positions.push([
-                            base.x + c[0] * VOXEL,
-                            base.y + c[1] * VOXEL,
-                            base.z + c[2] * VOXEL,
-                        ]);
-                        normals.push(face.normal);
-                        colors.push([col[0] * s, col[1] * s, col[2] * s, 1.0]);
+                    if id == ORE {
+                        // Crystal faces: hot vertex colors on the unlit mesh.
+                        // 1.6–3.0x pushes them past 1.0 so bloom picks them up;
+                        // per-voxel jitter makes a vein shimmer, not a flat slab.
+                        let h = 1.6 + 1.4 * hash_unit(v, 0x91F7);
+                        glow.push_face(
+                            base,
+                            face,
+                            [col[0] * h, col[1] * h, col[2] * h, 1.0],
+                        );
+                    } else {
+                        let s = face.shade;
+                        solid.push_face(base, face, [col[0] * s, col[1] * s, col[2] * s, 1.0]);
                     }
-                    indices.extend_from_slice(&[i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3]);
                 }
             }
         }
     }
 
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    .with_inserted_indices(Indices::U32(indices))
+    (solid.into_mesh(), glow.into_mesh())
 }
 
 // ---------------------------------------------------------------------------
 // Systems — chunk lifecycle
 // ---------------------------------------------------------------------------
 
+/// Solid + glow mesh entities for each chunk.
 #[derive(Resource, Default)]
-pub struct ChunkEntities(HashMap<IVec3, Entity>);
+pub struct ChunkEntities(HashMap<IVec3, (Entity, Entity)>);
 
 #[derive(Resource)]
 pub struct WorldAssets {
     pub material: Handle<StandardMaterial>,
+    pub glow_material: Handle<StandardMaterial>,
 }
 
 #[derive(Component)]
@@ -556,6 +602,13 @@ fn setup_world_assets(mut commands: Commands, mut materials: ResMut<Assets<Stand
         material: materials.add(StandardMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: 0.95,
+            ..default()
+        }),
+        // Unlit: vertex colors pass through at full (HDR) brightness, so
+        // crystals glow in pitch-dark tunnels and feed the bloom pass.
+        glow_material: materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            unlit: true,
             ..default()
         }),
     });
@@ -582,20 +635,56 @@ fn ensure_chunks(
                     continue;
                 }
                 world.generate_chunk(cp);
-                let handle = meshes.add(Mesh::new(
-                    PrimitiveTopology::TriangleList,
-                    RenderAssetUsages::default(),
-                ));
-                let entity = commands
-                    .spawn((
-                        Mesh3d(handle),
-                        MeshMaterial3d(assets.material.clone()),
-                        Transform::IDENTITY,
-                        Visibility::Hidden,
-                        ChunkMesh,
-                    ))
-                    .id();
-                chunk_entities.0.insert(cp, entity);
+                let mut spawn_mesh = |material: &Handle<StandardMaterial>| {
+                    let handle = meshes.add(Mesh::new(
+                        PrimitiveTopology::TriangleList,
+                        RenderAssetUsages::default(),
+                    ));
+                    commands
+                        .spawn((
+                            Mesh3d(handle),
+                            MeshMaterial3d(material.clone()),
+                            Transform::IDENTITY,
+                            Visibility::Hidden,
+                            ChunkMesh,
+                        ))
+                        .id()
+                };
+                let solid = spawn_mesh(&assets.material);
+                let glow = spawn_mesh(&assets.glow_material);
+                chunk_entities.0.insert(cp, (solid, glow));
+            }
+        }
+    }
+}
+
+fn remesh_dirty(
+    mut world: ResMut<VoxelWorld>,
+    chunk_entities: Res<ChunkEntities>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut chunks: Query<(&Mesh3d, &mut Visibility), With<ChunkMesh>>,
+) {
+    if world.dirty.is_empty() {
+        return;
+    }
+    let batch: Vec<IVec3> = world.dirty.iter().copied().take(REMESH_BUDGET).collect();
+    for cp in batch {
+        world.dirty.remove(&cp);
+        let Some(&(solid_e, glow_e)) = chunk_entities.0.get(&cp) else {
+            continue;
+        };
+        let (solid_mesh, glow_mesh) = mesh_chunk(&world, cp);
+        for (entity, mesh) in [(solid_e, solid_mesh), (glow_e, glow_mesh)] {
+            let empty = mesh.count_vertices() == 0;
+            if let Ok((mesh3d, mut vis)) = chunks.get_mut(entity) {
+                // Can only fail if the handle's asset id is stale, which would
+                // mean the chunk entity itself is gone — nothing useful to do.
+                let _ = meshes.insert(&mesh3d.0, mesh);
+                *vis = if empty {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Visible
+                };
             }
         }
     }
@@ -620,9 +709,9 @@ mod tests {
     #[test]
     fn worldgen_surface_and_rim() {
         let mid = WORLD_VOXELS_XZ / 2;
-        // Center of the claim: air above ground, soil at the surface layer.
+        // Center of the claim: air above ground, regolith at the surface layer.
         assert_eq!(block_at(IVec3::new(mid, 0, mid)), AIR);
-        assert_eq!(block_at(IVec3::new(mid, -1, mid)), SOIL);
+        assert_eq!(block_at(IVec3::new(mid, -1, mid)), REGOLITH);
         // Rim is indestructible at depth and forms a wall above the surface.
         assert_eq!(block_at(IVec3::new(0, -10, mid)), BARRIER);
         assert_eq!(block_at(IVec3::new(0, 1, mid)), BARRIER);
@@ -657,6 +746,9 @@ mod tests {
         let hit = raycast(&w, eye, Vec3::NEG_Y, 10.0).expect("should hit ground");
         assert_eq!(hit.voxel.y, -1);
         assert_eq!(hit.normal, IVec3::Y);
+        // The reported hit parameter must land the ray on the struck face.
+        let p = eye + Vec3::NEG_Y * hit.t;
+        assert!((p.y - 0.0).abs() < 1e-3);
         // Looking up: sky, no hit.
         assert!(raycast(&w, eye, Vec3::Y, 10.0).is_none());
     }
@@ -677,8 +769,37 @@ mod tests {
     #[test]
     fn surface_chunk_meshes_nonempty() {
         let w = test_world();
-        let mesh = mesh_chunk(&w, IVec3::new(1, -1, 1));
-        assert!(mesh.count_vertices() > 0);
+        let (solid, _glow) = mesh_chunk(&w, IVec3::new(1, -1, 1));
+        assert!(solid.count_vertices() > 0);
+    }
+
+    #[test]
+    fn ore_faces_go_to_glow_mesh() {
+        let mut w = VoxelWorld::default();
+        w.generate_chunk(IVec3::new(2, -2, 2));
+        // Carve out a pocket around a deep voxel and force its neighbors open
+        // so whatever block is there gets faces. Then check ore voxels emit
+        // glow geometry: find an ore voxel in this chunk.
+        let origin = IVec3::new(2, -2, 2) * CHUNK;
+        let mut ore_voxel = None;
+        // Interior voxels only, so the exposing neighbor stays inside this
+        // (single generated) chunk — set_air on an ungenerated chunk no-ops.
+        for y in 1..CHUNK - 1 {
+            for z in 1..CHUNK - 1 {
+                for x in 1..CHUNK - 1 {
+                    let v = origin + IVec3::new(x, y, z);
+                    if w.block(v) == ORE {
+                        ore_voxel = Some(v);
+                    }
+                }
+            }
+        }
+        let Some(v) = ore_voxel else {
+            return; // no interior ore in this chunk for this seed — fine
+        };
+        w.set_air(v + IVec3::X); // expose at least one face
+        let (_solid, glow) = mesh_chunk(&w, IVec3::new(2, -2, 2));
+        assert!(glow.count_vertices() > 0);
     }
 
     /// Perf probe for the "blow up a lot of cubes" future. Not a pass/fail
@@ -705,13 +826,15 @@ mod tests {
         }
         let gen_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        let tri_count = |m: &Mesh| m.indices().map_or(0, |i| i.len() / 3);
+        let tri_count =
+            |m: &Mesh| m.indices().map_or(0, |i| i.len() / 3);
 
         // Full world mesh (worst case: every chunk at once, e.g. first load).
         let t = Instant::now();
         let mut tris = 0usize;
         for &cp in &all_chunks {
-            tris += tri_count(&mesh_chunk(&w, cp));
+            let (s, g) = mesh_chunk(&w, cp);
+            tris += tri_count(&s) + tri_count(&g);
         }
         let mesh_ms = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -744,47 +867,26 @@ mod tests {
         let t = Instant::now();
         let mut blast_tris = 0usize;
         for &cp in &dirty {
-            blast_tris += tri_count(&mesh_chunk(&w, cp));
+            let (s, g) = mesh_chunk(&w, cp);
+            blast_tris += tri_count(&s) + tri_count(&g);
         }
         let remesh_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        println!("--- bench: voxel={VOXEL}m, world {0}x{0} voxels, {1} chunks ---",
-            WORLD_VOXELS_XZ, all_chunks.len());
+        println!(
+            "--- bench: voxel={VOXEL}m, world {0}x{0} voxels, {1} chunks ---",
+            WORLD_VOXELS_XZ,
+            all_chunks.len()
+        );
         println!("worldgen:        {gen_ms:8.2} ms total");
-        println!("full mesh:       {mesh_ms:8.2} ms total, {tris} tris, {:.3} ms/chunk",
-            mesh_ms / all_chunks.len() as f64);
+        println!(
+            "full mesh:       {mesh_ms:8.2} ms total, {tris} tris, {:.3} ms/chunk",
+            mesh_ms / all_chunks.len() as f64
+        );
         println!("explosion (r=3m): carved {carved} voxels in {carve_ms:.2} ms");
-        println!("blast remesh:    {remesh_ms:8.2} ms for {} dirty chunks ({:.3} ms/chunk), {blast_tris} tris",
-            dirty.len(), remesh_ms / dirty.len().max(1) as f64);
-    }
-}
-
-fn remesh_dirty(
-    mut world: ResMut<VoxelWorld>,
-    chunk_entities: Res<ChunkEntities>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut chunks: Query<(&Mesh3d, &mut Visibility), With<ChunkMesh>>,
-) {
-    if world.dirty.is_empty() {
-        return;
-    }
-    let batch: Vec<IVec3> = world.dirty.iter().copied().take(REMESH_BUDGET).collect();
-    for cp in batch {
-        world.dirty.remove(&cp);
-        let Some(&entity) = chunk_entities.0.get(&cp) else {
-            continue;
-        };
-        let mesh = mesh_chunk(&world, cp);
-        let empty = mesh.count_vertices() == 0;
-        if let Ok((mesh3d, mut vis)) = chunks.get_mut(entity) {
-            // Can only fail if the handle's asset id is stale, which would mean
-            // the chunk entity itself is gone — nothing useful to do about it.
-            let _ = meshes.insert(&mesh3d.0, mesh);
-            *vis = if empty {
-                Visibility::Hidden
-            } else {
-                Visibility::Visible
-            };
-        }
+        println!(
+            "blast remesh:    {remesh_ms:8.2} ms for {} dirty chunks ({:.3} ms/chunk), {blast_tris} tris",
+            dirty.len(),
+            remesh_ms / dirty.len().max(1) as f64
+        );
     }
 }

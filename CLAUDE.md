@@ -1,21 +1,26 @@
 # [Limits]
 
-A Bevy 0.18 incremental mining game: first-person 3D voxel digging (0.25m cubes — the player is ~6 voxels tall). Dig down as far as possible; each 64-layer (16m) band doubles block HP and raises ore value, you fill a limited pack with ore, sell it at the surface shop, and buy pickaxe/pack/teleport upgrades to push deeper. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
+A Bevy 0.18 incremental space-mining game: first-person **laser mining on a very large asteroid** (0.25m voxels — the player is ~6 voxels tall). Carve down as far as possible; each 64-layer (16m) band doubles block HP and raises crystal value, loot tractors into your hold, you sell at the surface depot and buy laser/coolant/tractor/recall upgrades to push deeper. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
 
 ## Game loop & controls
 
-- Click to grab the cursor. WASD + Space + mouse-look, hold **LMB** to mine the block under the crosshair (RPG-style: tool damage per swing vs block HP).
-- Every destroyed voxel drops physical loot (dirt/stone $1 at band 0, doubling per band; ore much more) that you walk over to magnet-collect; a full pack leaves drops lying on the ground.
-- **Q** tosses a TNT charge: 2s fuse, carves a 4m-radius sphere, every voxel drops loot. Free while the mechanic is being playtested.
-- **E** at the gold shop pad sells everything (inventory is unlimited); **1/2/3** buy damage / swing speed / recall device. **T** recalls to the surface, **G** dives back to best depth (after buying recall).
-- Hits pop floating damage numbers (gold + larger on a killing blow). HUD is styled panels: stats top-left, reticle + target HP bar at center, shop panel by the pad, status toast at the bottom.
+- Click to grab the cursor. WASD + mouse-look; **Space** jumps, and held while airborne fires the **jetpack** (weak but tireless — asteroid gravity is 7.5 m/s²).
+- Hold **LMB** to fire the mining laser: continuous DPS vs block HP. The beam builds **heat**; at 100% it locks and vents for ~2s (red emitter, warning text). Coolant upgrades stretch fire time.
+- Every destroyed voxel drops physical loot that tractor-beams to you in range; crystals glow in the walls (band 0 "Carbon" is deliberately modest — colors get loud deeper).
+- **Q** throws a plasma charge: 2s fuse, carves a 4m sphere, loot arrives as *stacked* drops. You start with 2; more are 60 cr at the depot.
+- **E** at the depot pad sells the hold; **1/2/3/4/5** buy laser power / coolant loop / tractor field / recall rig / plasma charges. **T** recalls to the surface, **G** dives back to best depth (after buying recall).
+- Hits pop floating damage numbers (gold + larger on a killing blow); sells pop credit text at the pad. HUD is styled panels: stats top-left, reticle + heat bar + target HP bar at center, depot panel by the pad, status toast at the bottom.
 - The whole progression curve (HP/value/cost growth factors) lives in the constants at the top of `src/game.rs` and `src/world.rs`.
 
 ## Architecture notes
 
 - World: fixed 96x96-voxel (24m) claim, chunked 16³, generated lazily downward; worldgen is a pure function of voxel coords (`world::block_at`), so chunks store one byte per voxel and partial mining damage is a sparse map.
 - Perf probe for cube-size decisions: `cargo test bench_remesh -- --ignored --nocapture` prints worldgen/mesh/explosion-remesh timings headlessly.
-- Rendering: one naive-culled mesh per chunk, vertex-colored (no textures), remeshed on demand with a per-frame budget. Lighting is faked: sun/ambient/sky fade with depth, headlamp point light underground.
+- Rendering: **two** naive-culled meshes per chunk, vertex-colored (no block textures): a lit mesh for rock, and an unlit mesh whose vertex colors run >1.0 for crystal faces — the HDR camera + bloom turn those into glowing ore veins. Remeshed on demand with a per-frame budget.
+- The camera carries `Hdr` + `Bloom` + `Tonemapping::TonyMcMapface` (inserted by `sky.rs` in PostStartup). Every glow in the game — laser beam, crystals, sun, depot beacon, sparks — is just an unlit material with linear color >1.0 feeding that bloom pass. Keep light intensities modest: a spotlight concentrates lumens ~10x vs a point light and will white-disc any close wall.
+- Sky (`sky.rs`): a starfield **cubemap** (milky way, nebulae, hashed stars) generated into an `Image` at startup + HDR sun ball, ringed gas giant (procedural equirect texture), moon, twinkling foreground stars, shooting stars, a cratered heightfield horizon for the host asteroid, and headlamp dust motes underground. Zero texture/model assets in the repo.
+- Audio (`audio.rs`): every clip synthesized at startup into in-memory WAVs (`AudioSource { bytes }` — needs the `wav` cargo feature). Gameplay pushes `SfxEvent`s into the `SfxQueue` resource; loops (laser hum, jetpack, ambient drone) follow the `LaserState`/`JetState` resources. No audio files.
+- Explosions aggregate loot into **stacked drops** (`count` per drop entity, ≤14 stacks per material group) — never one drop per voxel; a 4m blast carves ~12k voxels and one-entity-per-voxel was 553k entities / 9 FPS in playtesting.
 
 ## Pinned versions
 
@@ -73,26 +78,37 @@ Don't build these yet; note them so we don't forget.
 - **Steam integration** — likely `bevy_steamworks` or raw `steamworks-rs`. Decision pending: which is more actively maintained against current Bevy.
 - **Save system** — needed before any real release: wallet/upgrades/max-depth plus mined-voxel diffs (worldgen is deterministic, so a save is just the diff set). serde + bincode.
 - **Greedy meshing + texture atlas** — naive per-face meshing is fine at current scale; revisit if hollowed-out worlds get deep enough to hurt.
-- **Sound** — mining hits, block break, sell ka-ching. Zero audio assets today.
+- **Spatial audio** — SFX are flat mono today; `PlaybackSettings::with_spatial` exists when it matters.
+- **Surface shadows** — DirectionalLight shadows would make the boulder field gorgeous; needs cascade tuning vs the deep shaft.
 
 ## Layout
 
 ```
 src/
-  main.rs    App wiring, sun + depth-based lighting fade, bench-exit hook
-  world.rs   Voxel storage/worldgen/meshing/raycast, chunk lifecycle (WorldPlugin)
-  player.rs  First-person controller, voxel AABB collision, mining (PlayerPlugin)
-  items.rs   Physical loot drops + pickup magnet, TNT, debris chips (ItemsPlugin)
-  game.rs    Wallet/inventory/upgrades/shop/teleports — the incremental economy (GamePlugin)
-  hud.rs     Stats, crosshair + target HP bar, shop panel, status line (HudPlugin)
+  main.rs    App wiring, GameplaySet, sun + depth lighting fade, bench-exit hook
+  world.rs   Voxel storage/worldgen/dual meshing (lit + glow)/raycast, chunks (WorldPlugin)
+  player.rs  FPS controller + jetpack, voxel AABB collision, laser mining + heat,
+             beam/impact FX, viewmodel sway, screen shake (PlayerPlugin)
+  items.rs   Stacked loot drops + tractor pickup, plasma charges, explosions
+             (flash/shockwave/sparks/debris) (ItemsPlugin)
+  game.rs    Credits/hold/upgrades/depot/teleports — the incremental economy (GamePlugin)
+  hud.rs     Stats, reticle + heat bar + target HP bar, depot panel, float text (HudPlugin)
+  sky.rs     Starfield cubemap, HDR camera setup, sun/planet/moon/stars/horizon (SkyPlugin)
+  audio.rs   Procedural WAV synthesis, SfxQueue, laser/jet/ambient loops (SoundPlugin)
+  demo.rs    LIMITS_DEMO scripted tour + screenshots — hands-off verification (DemoPlugin)
 .cargo/
   config.toml      Windows fast-link config (rust-lld for MSVC ABI)
 rust-toolchain.toml  Pins GNU ABI on this machine; see "Toolchain" above
 ```
 
-## Bench hooks
+## Bench & verification hooks
 
 - `LIMITS_BENCH_EXIT_AFTER=<seconds>` — process exits after that elapsed wall time.
+- `LIMITS_DEMO=1` — scripted ~28s tour (sky pan → laser → overheat → plasma crater → crater pan → jetpack → depot sell) that saves 8 PNGs into `shots/` and logs `[demo]` position breadcrumbs to stderr. Combine both for a self-terminating visual smoke test:
+
+```sh
+LIMITS_DEMO=1 LIMITS_BENCH_EXIT_AFTER=29 ./target/release/limits.exe > demo.log 2>&1
+```
 
 `LogDiagnosticsPlugin` writes FPS / frame_time / entity_count to stdout once per second, so:
 

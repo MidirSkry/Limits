@@ -15,3 +15,8 @@ Thumbs.db
 # Bevy / dynamic_linking sidecar artifacts (in case any escape /target)
 bevy_dylib*.dll
 bevy_dylib*.pdb
+
+# Local bench/verification artifacts
+*.log
+dist/
+shots/

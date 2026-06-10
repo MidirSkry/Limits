@@ -4,36 +4,37 @@ use bevy::diagnostic::{
 use bevy::prelude::*;
 use std::time::Duration;
 
+mod audio;
+mod demo;
 mod game;
 mod hud;
 mod items;
 mod player;
+mod sky;
 mod world;
 
 use player::PlayerState;
 
-// Sky color at the surface; fades to near-black as you descend so the mine
-// feels like a mine even though we do no real light occlusion.
-const SKY_COLOR: Vec3 = Vec3::new(0.36, 0.58, 0.85);
-const CAVE_COLOR: Vec3 = Vec3::new(0.01, 0.01, 0.015);
-/// Depth (m) over which daylight fades out completely.
-const DAYLIGHT_FADE_M: f32 = 8.0;
-const SUN_LUX: f32 = 9_000.0;
-const AMBIENT_SURFACE: f32 = 220.0;
+/// Systems that read player input and mutate gameplay state. The demo driver
+/// runs before this set so injected input is seen the same frame.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GameplaySet;
+
+/// Hard vacuum: the sun switches off fast once rock swallows the sky.
+const DAYLIGHT_FADE_M: f32 = 6.0;
+const SUN_LUX: f32 = 8_000.0;
+const AMBIENT_SURFACE: f32 = 60.0;
 /// Ambient floor underground so unlit faces aren't pure black.
-const AMBIENT_CAVE: f32 = 25.0;
+const AMBIENT_CAVE: f32 = 7.0;
 
 fn main() {
     App::new()
-        .insert_resource(ClearColor(Color::linear_rgb(
-            SKY_COLOR.x,
-            SKY_COLOR.y,
-            SKY_COLOR.z,
-        )))
+        // Behind the skybox; effectively only visible for one frame at boot.
+        .insert_resource(ClearColor(Color::linear_rgb(0.002, 0.003, 0.006)))
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "[Limits] — dig deeper".into(),
+                    title: "LIMITS — asteroid claim".into(),
                     present_mode: bevy::window::PresentMode::AutoNoVsync,
                     // On wasm, attach to the <canvas id="bevy"> in index.html.
                     canvas: Some("#bevy".to_string()),
@@ -55,6 +56,9 @@ fn main() {
             items::ItemsPlugin,
             game::GamePlugin,
             hud::HudPlugin,
+            sky::SkyPlugin,
+            audio::SoundPlugin,
+            demo::DemoPlugin,
         ))
         .add_systems(Startup, setup_lights)
         .add_systems(Update, (depth_lighting, bench_auto_exit))
@@ -74,16 +78,17 @@ fn setup_lights(mut commands: Commands) {
             shadows_enabled: false,
             ..default()
         },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, 0.5, 0.0)),
+        // Shine from the sun's sky position toward the claim.
+        Transform::default().looking_to(-sky::sun_direction(), Vec3::Y),
         Sun,
     ));
 }
 
-/// Fade sun, ambient, and sky toward darkness as the player descends. The
-/// headlamp (child of the camera) becomes the dominant light underground.
+/// Fade sun and ambient toward darkness as the player descends. The helmet
+/// lamp (child of the camera) becomes the dominant light underground; the
+/// skybox stays — looking up a deep shaft shows stars, as it should.
 fn depth_lighting(
     player: Res<PlayerState>,
-    mut clear: ResMut<ClearColor>,
     mut ambients: Query<&mut AmbientLight>,
     mut suns: Query<&mut DirectionalLight, With<Sun>>,
 ) {
@@ -94,8 +99,6 @@ fn depth_lighting(
     if let Ok(mut sun) = suns.single_mut() {
         sun.illuminance = SUN_LUX * daylight;
     }
-    let sky = CAVE_COLOR.lerp(SKY_COLOR, daylight);
-    clear.0 = Color::linear_rgb(sky.x, sky.y, sky.z);
 }
 
 // When LIMITS_BENCH_EXIT_AFTER=<seconds> is set, the process exits after that
