@@ -1,6 +1,17 @@
 # [Limits]
 
-A Bevy 0.18 sandbox for high-entity-count simulation. Goal: prove the stack can move 100k+ independently-simulated entities at high frame rates and learn where the cliffs are.
+A Bevy 0.18 incremental mining game: first-person 3D voxel digging (0.5m cubes — the player is ~3 voxels tall). Dig down as far as possible; each 32-layer band doubles block HP and raises ore value, you fill a limited pack with ore, sell it at the surface shop, and buy pickaxe/pack/teleport upgrades to push deeper. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
+
+## Game loop & controls
+
+- Click to grab the cursor. WASD + Space + mouse-look, hold **LMB** to mine the block under the crosshair (RPG-style: tool damage per swing vs block HP).
+- **E** at the gold shop pad sells the pack; **1/2/3/4** buy damage / swing speed / capacity / recall device. **T** recalls to the surface, **G** dives back to best depth (after buying recall).
+- The whole progression curve (HP/value/cost growth factors) lives in the constants at the top of `src/game.rs` and `src/world.rs`.
+
+## Architecture notes
+
+- World: fixed 48x48-voxel claim, chunked 16³, generated lazily downward; worldgen is a pure function of voxel coords (`world::block_at`), so chunks store one byte per voxel and partial mining damage is a sparse map.
+- Rendering: one naive-culled mesh per chunk, vertex-colored (no textures), remeshed on demand with a per-frame budget. Lighting is faked: sun/ambient/sky fade with depth, headlamp point light underground.
 
 ## Pinned versions
 
@@ -56,15 +67,19 @@ Don't put this project inside a directory whose name contains square brackets. B
 Don't build these yet; note them so we don't forget.
 
 - **Steam integration** — likely `bevy_steamworks` or raw `steamworks-rs`. Decision pending: which is more actively maintained against current Bevy.
-- **Asset pipeline** — currently zero assets, just colored quads. When we add real sprites/audio, set up `AssetPlugin` paths and a hot-reload story.
-- **Save system** — serde + bincode for component snapshots. Decide later: per-entity or chunked-archetype.
+- **Save system** — needed before any real release: wallet/upgrades/max-depth plus mined-voxel diffs (worldgen is deterministic, so a save is just the diff set). serde + bincode.
+- **Greedy meshing + texture atlas** — naive per-face meshing is fine at current scale; revisit if hollowed-out worlds get deep enough to hurt.
+- **Sound** — mining hits, block break, sell ka-ching. Zero audio assets today.
 
 ## Layout
 
 ```
 src/
-  main.rs    App setup, camera, HUD, optional bench-exit hook
-  sim.rs     SimulationPlugin: components, spawn, motion, input
+  main.rs    App wiring, sun + depth-based lighting fade, bench-exit hook
+  world.rs   Voxel storage/worldgen/meshing/raycast, chunk lifecycle (WorldPlugin)
+  player.rs  First-person controller, voxel AABB collision, mining, debris (PlayerPlugin)
+  game.rs    Wallet/inventory/upgrades/shop/teleports — the incremental economy (GamePlugin)
+  hud.rs     Stats, crosshair + target HP bar, shop panel, status line (HudPlugin)
 .cargo/
   config.toml      Windows fast-link config (rust-lld for MSVC ABI)
 rust-toolchain.toml  Pins GNU ABI on this machine; see "Toolchain" above
@@ -72,15 +87,12 @@ rust-toolchain.toml  Pins GNU ABI on this machine; see "Toolchain" above
 
 ## Bench hooks
 
-Two env vars let you drive headless benchmarks without UI interaction:
-
-- `LIMITS_COUNT=<n>` — initial entity count (overrides `ENTITY_COUNT_DEFAULT`).
 - `LIMITS_BENCH_EXIT_AFTER=<seconds>` — process exits after that elapsed wall time.
 
-`LogDiagnosticsPlugin` writes FPS / frame_time to stdout once per second, so:
+`LogDiagnosticsPlugin` writes FPS / frame_time / entity_count to stdout once per second, so:
 
 ```sh
-LIMITS_COUNT=250000 LIMITS_BENCH_EXIT_AFTER=15 ./target/release/limits.exe > bench.log 2>&1
+LIMITS_BENCH_EXIT_AFTER=15 ./target/release/limits.exe > bench.log 2>&1
 ```
 
 …gives you a clean log to scrape.

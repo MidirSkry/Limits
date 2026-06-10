@@ -1,106 +1,103 @@
 use bevy::diagnostic::{
-    DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin,
-    LogDiagnosticsPlugin,
+    EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin,
 };
-use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
 use std::time::Duration;
 
-// Camera zoom limits, expressed as orthographic `scale` (world units per screen unit).
-// 1.0 = default. Smaller = zoomed in, larger = zoomed out.
-const ZOOM_MIN: f32 = 0.05;
-const ZOOM_MAX: f32 = 20.0;
-// Per-scroll-tick exponent. Multiplicative so each tick gives the same perceptual step
-// regardless of current zoom level.
-const ZOOM_STEP: f32 = 0.15;
+mod game;
+mod hud;
+mod player;
+mod world;
 
-mod sim;
-use sim::{SimState, SimulationPlugin};
+use player::PlayerState;
+
+// Sky color at the surface; fades to near-black as you descend so the mine
+// feels like a mine even though we do no real light occlusion.
+const SKY_COLOR: Vec3 = Vec3::new(0.36, 0.58, 0.85);
+const CAVE_COLOR: Vec3 = Vec3::new(0.01, 0.01, 0.015);
+/// Depth (m) over which daylight fades out completely.
+const DAYLIGHT_FADE_M: f32 = 8.0;
+const SUN_LUX: f32 = 9_000.0;
+const AMBIENT_SURFACE: f32 = 220.0;
+/// Ambient floor underground so unlit faces aren't pure black.
+const AMBIENT_CAVE: f32 = 25.0;
 
 fn main() {
     App::new()
+        .insert_resource(ClearColor(Color::linear_rgb(
+            SKY_COLOR.x,
+            SKY_COLOR.y,
+            SKY_COLOR.z,
+        )))
         .add_plugins((
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "[Limits] — Bevy 0.18 stress test".into(),
-                        present_mode: bevy::window::PresentMode::AutoNoVsync,
-                        // On wasm, attach Bevy's renderer to the <canvas id="bevy">
-                        // element in index.html. Ignored on desktop. fit_canvas_to_parent
-                        // tracks the body's size so CSS resizing actually changes the
-                        // render-target resolution (otherwise we'd render at 1280x720
-                        // and the browser would stretch it).
-                        canvas: Some("#bevy".to_string()),
-                        fit_canvas_to_parent: true,
-                        ..default()
-                    }),
-                    ..default()
-                })
-                // Use the existing Images/ directory as the asset root rather than the
-                // conventional assets/. Keeps the user's chosen layout intact.
-                .set(AssetPlugin {
-                    file_path: "Images".to_string(),
+            DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "[Limits] — dig deeper".into(),
+                    present_mode: bevy::window::PresentMode::AutoNoVsync,
+                    // On wasm, attach to the <canvas id="bevy"> in index.html.
+                    canvas: Some("#bevy".to_string()),
+                    fit_canvas_to_parent: true,
                     ..default()
                 }),
+                ..default()
+            }),
             FrameTimeDiagnosticsPlugin::default(),
             EntityCountDiagnosticsPlugin::default(),
-            // Logs all registered diagnostics (FPS, frame_time, entity_count, plus our
-            // custom motion/sync timers from SimulationPlugin) once per second so
-            // headless benches can capture numbers without screen-scraping the HUD.
+            // Once-per-second FPS/frame_time/entity_count to stdout for headless
+            // benches (see CLAUDE.md bench hooks).
             LogDiagnosticsPlugin {
                 wait_duration: Duration::from_secs(1),
                 ..default()
             },
-            SimulationPlugin,
+            world::WorldPlugin,
+            player::PlayerPlugin,
+            game::GamePlugin,
+            hud::HudPlugin,
         ))
-        .add_systems(Startup, setup)
-        .add_systems(Update, (update_hud, bench_auto_exit, zoom_camera))
+        .add_systems(Startup, setup_lights)
+        .add_systems(Update, (depth_lighting, bench_auto_exit))
         .run();
 }
 
 #[derive(Component)]
-struct HudText;
+struct Sun;
 
-fn setup(mut commands: Commands) {
-    commands.spawn(Camera2d);
-
+fn setup_lights(mut commands: Commands) {
     commands.spawn((
-        Text::new("FPS: --"),
-        TextFont {
-            font_size: 14.0,
+        DirectionalLight {
+            illuminance: SUN_LUX,
+            // No shadow maps: depth-based darkening below carries the "deep
+            // underground" read, and skipping shadows avoids cascade tuning
+            // for a shaft hundreds of meters tall.
+            shadows_enabled: false,
             ..default()
         },
-        TextColor(Color::WHITE),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
-            left: Val::Px(8.0),
-            ..default()
-        },
-        HudText,
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, 0.5, 0.0)),
+        Sun,
     ));
 }
 
-// Mouse-wheel zoom on the 2D camera's orthographic projection. Multiplicative so each
-// scroll tick feels like the same step regardless of current zoom.
-fn zoom_camera(
-    scroll: Res<AccumulatedMouseScroll>,
-    mut cameras: Query<&mut Projection, With<Camera2d>>,
+/// Fade sun, ambient, and sky toward darkness as the player descends. The
+/// headlamp (child of the camera) becomes the dominant light underground.
+fn depth_lighting(
+    player: Res<PlayerState>,
+    mut clear: ResMut<ClearColor>,
+    mut ambients: Query<&mut AmbientLight>,
+    mut suns: Query<&mut DirectionalLight, With<Sun>>,
 ) {
-    if scroll.delta.y == 0.0 {
-        return;
+    let daylight = (1.0 - player.depth_m() / DAYLIGHT_FADE_M).clamp(0.0, 1.0);
+    for mut ambient in &mut ambients {
+        ambient.brightness = AMBIENT_CAVE + (AMBIENT_SURFACE - AMBIENT_CAVE) * daylight;
     }
-    let factor = (-scroll.delta.y * ZOOM_STEP).exp();
-    for mut projection in &mut cameras {
-        if let Projection::Orthographic(ortho) = projection.as_mut() {
-            ortho.scale = (ortho.scale * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-        }
+    if let Ok(mut sun) = suns.single_mut() {
+        sun.illuminance = SUN_LUX * daylight;
     }
+    let sky = CAVE_COLOR.lerp(SKY_COLOR, daylight);
+    clear.0 = Color::linear_rgb(sky.x, sky.y, sky.z);
 }
 
-// When LIMITS_BENCH_EXIT_AFTER=<seconds> is set, the process exits after that elapsed
-// wall time. Bypasses Bevy's messaging system on purpose — it's just a bench escape
-// hatch, not part of normal app lifecycle. Disabled on wasm (no env vars, no exit).
+// When LIMITS_BENCH_EXIT_AFTER=<seconds> is set, the process exits after that
+// elapsed wall time. Bench escape hatch only. Disabled on wasm (no env/exit).
 #[cfg(not(target_arch = "wasm32"))]
 fn bench_auto_exit(time: Res<Time>) {
     static SECS: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
@@ -118,31 +115,3 @@ fn bench_auto_exit(time: Res<Time>) {
 
 #[cfg(target_arch = "wasm32")]
 fn bench_auto_exit() {}
-
-fn update_hud(
-    diagnostics: Res<DiagnosticsStore>,
-    sim: Res<SimState>,
-    mut q: Query<&mut Text, With<HudText>>,
-) {
-    let fps = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FPS)
-        .and_then(|d| d.smoothed())
-        .unwrap_or(0.0);
-    let frame_time_ms = diagnostics
-        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
-        .and_then(|d| d.smoothed())
-        .unwrap_or(0.0);
-
-    if let Ok(mut text) = q.single_mut() {
-        let state = if sim.paused { "PAUSED" } else { "RUNNING" };
-        text.0 = format!(
-            "FPS:      {fps:>6.1}\n\
-             Frame:    {frame_time_ms:>6.2} ms\n\
-             Entities: {count}\n\
-             State:    {state}\n\
-             \n\
-             [+/-]  scale entity count   [Space] pause   [R] reset",
-            count = sim.entity_count,
-        );
-    }
-}
