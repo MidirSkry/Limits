@@ -15,29 +15,29 @@ use std::collections::{HashMap, HashSet};
 // Tunables
 // ---------------------------------------------------------------------------
 
-/// Edge length of one voxel in world units (meters). Half a meter — the player
-/// is ~3 voxels tall, so cubes read as "much smaller than Minecraft".
-pub const VOXEL: f32 = 0.5;
+/// Edge length of one voxel in world units (meters). A quarter meter — the
+/// player is ~6 voxels tall, so destruction reads as genuinely fine-grained.
+pub const VOXEL: f32 = 0.25;
 pub const CHUNK: i32 = 16;
-/// World is 3x3 chunk columns = 48x48 voxels = 24m x 24m.
-pub const WORLD_CHUNKS_XZ: i32 = 3;
+/// World is 6x6 chunk columns = 96x96 voxels = 24m x 24m.
+pub const WORLD_CHUNKS_XZ: i32 = 6;
 pub const WORLD_VOXELS_XZ: i32 = CHUNK * WORLD_CHUNKS_XZ;
 
 /// Rim wall height above the surface (voxels) so you can't walk off the claim.
-const WALL_TOP: i32 = 3;
+const WALL_TOP: i32 = 6;
 /// Topsoil thickness (layers) before rock starts.
-const SOIL_LAYERS: i32 = 4;
-/// Layers per difficulty band. Each band doubles block HP and ~2.4x's ore value.
-pub const BAND_LAYERS: i32 = 32;
+const SOIL_LAYERS: i32 = 8;
+/// Layers per difficulty band (16m). Each band doubles block HP and ~2.4x's ore value.
+pub const BAND_LAYERS: i32 = 64;
 /// Chance for a buried block to be ore instead of rock.
-const ORE_CHANCE: f32 = 0.10;
-/// No ore in the first few layers — forces an early "sell dirt-cheap coal" loop.
-const ORE_MIN_DEPTH: i32 = 5;
+const ORE_CHANCE: f32 = 0.05;
+/// No ore in the first couple of meters — forces an early "sell cheap coal" loop.
+const ORE_MIN_DEPTH: i32 = 10;
 
-/// How many voxels below the player's feet we keep generated.
-const GEN_LOOKAHEAD_VOXELS: i32 = 40;
+/// How many voxels below the player's feet we keep generated (20m).
+const GEN_LOOKAHEAD_VOXELS: i32 = 80;
 /// Max chunk remeshes per frame (each is ~4k voxels; keeps frame spikes down).
-const REMESH_BUDGET: usize = 8;
+const REMESH_BUDGET: usize = 12;
 
 // ---------------------------------------------------------------------------
 // Block ids + stats
@@ -91,12 +91,14 @@ pub fn band_of_depth(depth: i32) -> i32 {
 }
 
 /// Max HP for a block. Doubles per band — the incremental difficulty wall.
+/// Smaller cubes mean ~4.5x more blocks per meter of shaft than the old 0.5m
+/// build, so per-block HP is roughly halved to keep dig-time-per-meter sane.
 pub fn block_hp(id: u8, depth: i32) -> f32 {
     let b = band_of_depth(depth);
     match id {
-        SOIL => 6.0,
-        ROCK => 10.0 * 2.0f32.powi(b),
-        ORE => 20.0 * 2.0f32.powi(b),
+        SOIL => 3.0,
+        ROCK => 6.0 * 2.0f32.powi(b),
+        ORE => 12.0 * 2.0f32.powi(b),
         BARRIER => f32::INFINITY,
         _ => 0.0,
     }
@@ -105,7 +107,7 @@ pub fn block_hp(id: u8, depth: i32) -> f32 {
 /// Sale value of one ore from the given band. Grows faster than HP (2.4x vs
 /// 2.0x) so net progression accelerates as you push deeper.
 pub fn ore_value(band: i32) -> u64 {
-    (15.0 * 2.4f64.powi(band)).round() as u64
+    (10.0 * 2.4f64.powi(band)).round() as u64
 }
 
 fn tier_suffix(tier: i32) -> String {
@@ -583,15 +585,16 @@ mod tests {
 
     #[test]
     fn worldgen_surface_and_rim() {
+        let mid = WORLD_VOXELS_XZ / 2;
         // Center of the claim: air above ground, soil at the surface layer.
-        assert_eq!(block_at(IVec3::new(24, 0, 24)), AIR);
-        assert_eq!(block_at(IVec3::new(24, -1, 24)), SOIL);
+        assert_eq!(block_at(IVec3::new(mid, 0, mid)), AIR);
+        assert_eq!(block_at(IVec3::new(mid, -1, mid)), SOIL);
         // Rim is indestructible at depth and forms a wall above the surface.
-        assert_eq!(block_at(IVec3::new(0, -10, 24)), BARRIER);
-        assert_eq!(block_at(IVec3::new(0, 1, 24)), BARRIER);
+        assert_eq!(block_at(IVec3::new(0, -10, mid)), BARRIER);
+        assert_eq!(block_at(IVec3::new(0, 1, mid)), BARRIER);
         // Outside the claim is treated as barrier.
-        assert_eq!(block_at(IVec3::new(-1, -5, 24)), BARRIER);
-        assert_eq!(block_at(IVec3::new(48, -5, 24)), BARRIER);
+        assert_eq!(block_at(IVec3::new(-1, -5, mid)), BARRIER);
+        assert_eq!(block_at(IVec3::new(WORLD_VOXELS_XZ, -5, mid)), BARRIER);
     }
 
     #[test]
@@ -642,6 +645,83 @@ mod tests {
         let w = test_world();
         let mesh = mesh_chunk(&w, IVec3::new(1, -1, 1));
         assert!(mesh.count_vertices() > 0);
+    }
+
+    /// Perf probe for the "blow up a lot of cubes" future. Not a pass/fail
+    /// test — prints numbers. Run with:
+    ///   cargo test bench_remesh -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_remesh_and_explosion() {
+        use std::time::Instant;
+
+        let mut w = VoxelWorld::default();
+        let depth_chunks = 8; // generate this many 16-voxel layers below ground
+
+        let t = Instant::now();
+        let mut all_chunks = Vec::new();
+        for cy in -depth_chunks..=0 {
+            for cx in 0..WORLD_CHUNKS_XZ {
+                for cz in 0..WORLD_CHUNKS_XZ {
+                    let cp = IVec3::new(cx, cy, cz);
+                    w.generate_chunk(cp);
+                    all_chunks.push(cp);
+                }
+            }
+        }
+        let gen_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let tri_count = |m: &Mesh| m.indices().map_or(0, |i| i.len() / 3);
+
+        // Full world mesh (worst case: every chunk at once, e.g. first load).
+        let t = Instant::now();
+        let mut tris = 0usize;
+        for &cp in &all_chunks {
+            tris += tri_count(&mesh_chunk(&w, cp));
+        }
+        let mesh_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // Simulated explosion: carve a 3m-radius sphere centered 10m down.
+        let half_m = WORLD_VOXELS_XZ as f32 * VOXEL * 0.5;
+        let center = Vec3::new(half_m, -10.0, half_m);
+        let r_m = 3.0;
+        let r_vox = (r_m / VOXEL).ceil() as i32;
+        let c_vox = (center / VOXEL).floor().as_ivec3();
+
+        w.dirty.clear();
+        let t = Instant::now();
+        let mut carved = 0usize;
+        for dy in -r_vox..=r_vox {
+            for dz in -r_vox..=r_vox {
+                for dx in -r_vox..=r_vox {
+                    let v = c_vox + IVec3::new(dx, dy, dz);
+                    let p = (v.as_vec3() + Vec3::splat(0.5)) * VOXEL;
+                    if p.distance(center) <= r_m && w.block(v) != AIR && w.block(v) != BARRIER
+                    {
+                        w.set_air(v);
+                        carved += 1;
+                    }
+                }
+            }
+        }
+        let carve_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let dirty: Vec<IVec3> = w.dirty.iter().copied().collect();
+        let t = Instant::now();
+        let mut blast_tris = 0usize;
+        for &cp in &dirty {
+            blast_tris += tri_count(&mesh_chunk(&w, cp));
+        }
+        let remesh_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        println!("--- bench: voxel={VOXEL}m, world {0}x{0} voxels, {1} chunks ---",
+            WORLD_VOXELS_XZ, all_chunks.len());
+        println!("worldgen:        {gen_ms:8.2} ms total");
+        println!("full mesh:       {mesh_ms:8.2} ms total, {tris} tris, {:.3} ms/chunk",
+            mesh_ms / all_chunks.len() as f64);
+        println!("explosion (r=3m): carved {carved} voxels in {carve_ms:.2} ms");
+        println!("blast remesh:    {remesh_ms:8.2} ms for {} dirty chunks ({:.3} ms/chunk), {blast_tris} tris",
+            dirty.len(), remesh_ms / dirty.len().max(1) as f64);
     }
 }
 

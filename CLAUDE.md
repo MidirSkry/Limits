@@ -1,6 +1,6 @@
 # [Limits]
 
-A Bevy 0.18 incremental mining game: first-person 3D voxel digging (0.5m cubes — the player is ~3 voxels tall). Dig down as far as possible; each 32-layer band doubles block HP and raises ore value, you fill a limited pack with ore, sell it at the surface shop, and buy pickaxe/pack/teleport upgrades to push deeper. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
+A Bevy 0.18 incremental mining game: first-person 3D voxel digging (0.25m cubes — the player is ~6 voxels tall). Dig down as far as possible; each 64-layer (16m) band doubles block HP and raises ore value, you fill a limited pack with ore, sell it at the surface shop, and buy pickaxe/pack/teleport upgrades to push deeper. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
 
 ## Game loop & controls
 
@@ -10,7 +10,8 @@ A Bevy 0.18 incremental mining game: first-person 3D voxel digging (0.5m cubes �
 
 ## Architecture notes
 
-- World: fixed 48x48-voxel claim, chunked 16³, generated lazily downward; worldgen is a pure function of voxel coords (`world::block_at`), so chunks store one byte per voxel and partial mining damage is a sparse map.
+- World: fixed 96x96-voxel (24m) claim, chunked 16³, generated lazily downward; worldgen is a pure function of voxel coords (`world::block_at`), so chunks store one byte per voxel and partial mining damage is a sparse map.
+- Perf probe for cube-size decisions: `cargo test bench_remesh -- --ignored --nocapture` prints worldgen/mesh/explosion-remesh timings headlessly.
 - Rendering: one naive-culled mesh per chunk, vertex-colored (no textures), remeshed on demand with a per-frame budget. Lighting is faked: sun/ambient/sky fade with depth, headlamp point light underground.
 
 ## Pinned versions

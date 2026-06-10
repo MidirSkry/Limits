@@ -15,21 +15,22 @@ use crate::world::{
 // Tunables
 // ---------------------------------------------------------------------------
 
-/// Player collision half-extents (so 0.6m wide, 1.4m tall — ~3 voxels).
+/// Player collision half-extents (so 0.6m wide, 1.4m tall — ~6 voxels).
 const PLAYER_HALF: Vec3 = Vec3::new(0.30, 0.70, 0.30);
 /// Eye height above the feet.
 const EYE: f32 = 1.25;
 const GRAVITY: f32 = -22.0;
 /// Falling faster than this risks crossing a whole voxel in one substep.
 const TERMINAL_FALL: f32 = 24.0;
-/// Jump impulse: apex ≈ 1.1m, enough to hop a 2-voxel (1m) step, so you can
+/// Jump impulse: apex ≈ 1.1m, enough to hop a 4-voxel (1m) step, so you can
 /// always staircase back out of your own mine before buying the recall device.
 const JUMP_VEL: f32 = 7.0;
 const WALK_SPEED: f32 = 4.5;
 const MOUSE_SENS: f32 = 0.0023;
-/// Mining reach in world units (7 voxels).
+/// Mining reach in world units (14 voxels).
 const REACH: f32 = 3.5;
-const DEBRIS_PER_BLOCK: usize = 4;
+/// Blocks break ~2x as often at 0.25m cubes, so fewer chips per block.
+const DEBRIS_PER_BLOCK: usize = 3;
 const DEBRIS_TTL: f32 = 0.7;
 
 // ---------------------------------------------------------------------------
@@ -172,7 +173,7 @@ fn setup_player(
         });
 
     commands.insert_resource(DebrisAssets {
-        mesh: meshes.add(Cuboid::new(0.12, 0.12, 0.12)),
+        mesh: meshes.add(Cuboid::new(0.08, 0.08, 0.08)),
         material: materials.add(StandardMaterial {
             base_color: Color::srgb(0.5, 0.45, 0.4),
             perceptual_roughness: 1.0,
