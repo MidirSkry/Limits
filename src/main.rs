@@ -37,17 +37,22 @@ fn main() {
         // Behind the skybox; effectively only visible for one frame at boot.
         .insert_resource(ClearColor(Color::linear_rgb(0.002, 0.003, 0.006)))
         .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "LIMITS — asteroid claim".into(),
-                    present_mode: bevy::window::PresentMode::AutoNoVsync,
-                    // On wasm, attach to the <canvas id="bevy"> in index.html.
-                    canvas: Some("#bevy".to_string()),
-                    fit_canvas_to_parent: true,
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "LIMITS — asteroid claim".into(),
+                        present_mode: bevy::window::PresentMode::AutoNoVsync,
+                        // On wasm, attach to the <canvas id="bevy"> in index.html.
+                        canvas: Some("#bevy".to_string()),
+                        fit_canvas_to_parent: true,
+                        ..default()
+                    }),
                     ..default()
-                }),
-                ..default()
-            }),
+                })
+                // audio.rs owns its own rodio stream (with device-loss
+                // recovery); bevy_audio's unrecoverable one would just hold
+                // a second handle on the device.
+                .disable::<bevy::audio::AudioPlugin>(),
             FrameTimeDiagnosticsPlugin::default(),
             EntityCountDiagnosticsPlugin::default(),
             // Once-per-second FPS/frame_time/entity_count to stdout for headless

@@ -11,10 +11,16 @@ default = []
 dev = ["bevy/dynamic_linking"]
 
 [dependencies]
-# `wav`: we synthesize all SFX at startup as in-memory WAV buffers (no asset
-# files); rodio needs the wav decoder. `tonemapping_luts`: TonyMcMapface for
-# the HDR/bloom space look.
-bevy = { version = "0.18.1", features = ["wav", "tonemapping_luts"] }
+# `tonemapping_luts`: TonyMcMapface for the HDR/bloom space look.
+# bevy_audio's plugin is disabled in main.rs — audio goes through our own
+# rodio stream (audio.rs) so a vanished output device can be recovered.
+bevy = { version = "0.18.1", features = ["tonemapping_luts"] }
+# Same rodio bevy_audio resolves to (keep these in lockstep). No decoder
+# features: every clip is synthesized as raw samples.
+rodio = { version = "0.20.1", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rodio = { version = "0.20.1", default-features = false, features = ["wasm-bindgen"] }
 
 # Optimize our own crate lightly so debug-build runtime is bearable at 100k+ entities,
 # and optimize all dependencies (including Bevy) fully — this is the standard Bevy

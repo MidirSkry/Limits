@@ -1,14 +1,21 @@
 //! All sound, synthesized at startup — zero asset files.
 //!
-//! Every clip is generated as PCM samples, wrapped in an in-memory WAV (the
-//! `wav` bevy feature provides the decoder), and stored as a normal
-//! `Handle<AudioSource>`. Gameplay systems never touch audio APIs directly:
-//! they push `SfxEvent`s into the `SfxQueue` resource and this module drains
-//! it. Loops (laser, jetpack, ambient drone) are driven from small state
-//! resources published by the player module.
+//! Every clip is generated as raw PCM samples and played through rodio
+//! DIRECTLY (not bevy_audio, whose one output stream is created at boot,
+//! private, and unrecoverable — a Bluetooth headset going to sleep used to
+//! kill all audio until restart). We own the `OutputStream`, and a watchdog
+//! polls the OS default output device: when it changes (headset sleeps,
+//! speakers unplugged, device comes back), the stream is rebuilt and the
+//! persistent loops respawn on the new device within ~a second.
+//!
+//! Gameplay systems never touch audio APIs directly: they push `SfxEvent`s
+//! into the `SfxQueue` resource and this module drains it. Loops (laser hum,
+//! jetpack, ambient drone, black-hole dread rumble) are driven from small
+//! state resources published by the player/blackhole modules.
 
-use bevy::audio::{AudioPlayer, AudioSink, AudioSource, PlaybackSettings, Volume};
 use bevy::prelude::*;
+use rodio::buffer::SamplesBuffer;
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 use std::sync::Arc;
 
 use crate::player::{JetState, LaserState};
@@ -55,6 +62,95 @@ impl SfxQueue {
 }
 
 // ---------------------------------------------------------------------------
+// Output device + clips
+// ---------------------------------------------------------------------------
+
+/// A synthesized mono clip, shared cheaply between plays.
+#[derive(Clone)]
+struct Clip(Arc<Vec<f32>>);
+
+impl Clip {
+    fn source(&self) -> SamplesBuffer<f32> {
+        SamplesBuffer::new(1, RATE, self.0.as_slice().to_vec())
+    }
+}
+
+/// Our own rodio output. The `OutputStream` is leaked (same trick bevy_audio
+/// uses: the stream is !Send, the handle isn't) — one small leak per device
+/// change, which is rare. `device_name` is what the watchdog diffs against.
+#[derive(Resource)]
+struct AudioOut {
+    handle: Option<OutputStreamHandle>,
+    device_name: Option<String>,
+}
+
+fn default_device_name() -> Option<String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    rodio::cpal::default_host()
+        .default_output_device()
+        .and_then(|d| d.name().ok())
+}
+
+impl AudioOut {
+    fn open() -> Self {
+        match OutputStream::try_default() {
+            Ok((stream, handle)) => {
+                core::mem::forget(stream);
+                Self {
+                    handle: Some(handle),
+                    device_name: default_device_name(),
+                }
+            }
+            Err(_) => Self {
+                handle: None,
+                device_name: default_device_name(),
+            },
+        }
+    }
+
+    /// Fire-and-forget one-shot.
+    fn play(&self, clip: &Clip, volume: f32, speed: f32) {
+        let Some(handle) = &self.handle else { return };
+        if let Ok(sink) = Sink::try_new(handle) {
+            sink.set_volume(volume);
+            sink.set_speed(speed);
+            sink.append(clip.source());
+            sink.detach();
+        }
+    }
+
+    /// A persistent looping sink (caller keeps it to retune volume/speed).
+    fn start_loop(&self, clip: &Clip, volume: f32) -> Option<Sink> {
+        let handle = self.handle.as_ref()?;
+        let sink = Sink::try_new(handle).ok()?;
+        sink.set_volume(volume);
+        sink.append(clip.source().repeat_infinite());
+        Some(sink)
+    }
+}
+
+/// The always-running loops. Laser/jet are started on demand by their ctl
+/// systems; drone + dread live for the whole session. All of them are dropped
+/// and rebuilt by the watchdog when the output device changes.
+#[derive(Resource, Default)]
+struct Loops {
+    drone: Option<Sink>,
+    dread: Option<Sink>,
+    laser: Option<Sink>,
+    jet: Option<Sink>,
+}
+
+impl Loops {
+    fn stop_all(&mut self) {
+        // Dropping a Sink stops it (the old ones are on a dead stream anyway).
+        self.drone = None;
+        self.dread = None;
+        self.laser = None;
+        self.jet = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -63,40 +159,45 @@ pub struct SoundPlugin;
 impl Plugin for SoundPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SfxQueue>()
+            .init_resource::<Loops>()
             .add_systems(Startup, setup_sfx)
             .add_systems(
                 Update,
-                (play_queued, laser_loop_ctl, jet_loop_ctl, dread_loop_ctl),
+                (
+                    audio_watchdog,
+                    play_queued,
+                    laser_loop_ctl,
+                    jet_loop_ctl,
+                    dread_loop_ctl,
+                ),
             );
     }
 }
 
 #[derive(Resource)]
 struct Sfx {
-    laser_loop: Handle<AudioSource>,
-    jet_loop: Handle<AudioSource>,
-    rock_break: Handle<AudioSource>,
-    crystal_break: Handle<AudioSource>,
-    pickup: Handle<AudioSource>,
-    sell: Handle<AudioSource>,
-    buy: Handle<AudioSource>,
-    deny: Handle<AudioSource>,
-    explosion: Handle<AudioSource>,
-    plant: Handle<AudioSource>,
-    land: Handle<AudioSource>,
-    warp_up: Handle<AudioSource>,
-    warp_down: Handle<AudioSource>,
-    overheat: Handle<AudioSource>,
-    vent: Handle<AudioSource>,
-    collapse: Handle<AudioSource>,
-    consumed: Handle<AudioSource>,
-    dawn: Handle<AudioSource>,
-    supernova: Handle<AudioSource>,
+    laser_loop: Clip,
+    jet_loop: Clip,
+    drone_loop: Clip,
+    dread_loop: Clip,
+    rock_break: Clip,
+    crystal_break: Clip,
+    pickup: Clip,
+    sell: Clip,
+    buy: Clip,
+    deny: Clip,
+    explosion: Clip,
+    plant: Clip,
+    land: Clip,
+    warp_up: Clip,
+    warp_down: Clip,
+    overheat: Clip,
+    vent: Clip,
+    collapse: Clip,
+    consumed: Clip,
+    dawn: Clip,
+    supernova: Clip,
 }
-
-/// Entity of the always-running black-hole rumble loop (volume rides dread).
-#[derive(Resource)]
-struct DreadLoop(Entity);
 
 // ---------------------------------------------------------------------------
 // Synthesis primitives
@@ -112,34 +213,14 @@ fn noise(i: usize) -> f32 {
     ((x >> 40) as f32) / ((1u64 << 24) as f32) * 2.0 - 1.0
 }
 
-/// Normalize peak to `peak`, encode 16-bit mono WAV, hand back an AudioSource.
-fn wav(mut samples: Vec<f32>, peak: f32) -> AudioSource {
+/// Normalize peak to `peak` and wrap as a shareable clip.
+fn clip(mut samples: Vec<f32>, peak: f32) -> Clip {
     let max = samples.iter().fold(1e-6f32, |m, s| m.max(s.abs()));
     let k = peak / max;
     for s in &mut samples {
-        *s *= k;
+        *s = (*s * k).clamp(-1.0, 1.0);
     }
-    let n = samples.len() as u32;
-    let data_len = n * 2;
-    let mut b: Vec<u8> = Vec::with_capacity(44 + data_len as usize);
-    b.extend_from_slice(b"RIFF");
-    b.extend_from_slice(&(36 + data_len).to_le_bytes());
-    b.extend_from_slice(b"WAVEfmt ");
-    b.extend_from_slice(&16u32.to_le_bytes()); // PCM chunk size
-    b.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    b.extend_from_slice(&1u16.to_le_bytes()); // mono
-    b.extend_from_slice(&RATE.to_le_bytes());
-    b.extend_from_slice(&(RATE * 2).to_le_bytes()); // byte rate
-    b.extend_from_slice(&2u16.to_le_bytes()); // block align
-    b.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    b.extend_from_slice(b"data");
-    b.extend_from_slice(&data_len.to_le_bytes());
-    for s in &samples {
-        b.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes());
-    }
-    AudioSource {
-        bytes: Arc::from(b.into_boxed_slice()),
-    }
+    Clip(Arc::new(samples))
 }
 
 /// Render `secs` of audio through a per-sample closure of (t, i).
@@ -166,7 +247,7 @@ fn expd(t: f32, tau: f32) -> f32 {
 // Clip recipes
 // ---------------------------------------------------------------------------
 
-fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
+fn setup_sfx(mut commands: Commands) {
     // Mining laser: detuned saw + harmonics with a 7Hz phase wobble. Both the
     // carrier (98Hz) and the wobble are integer cycles over the 1s buffer, so
     // it loops seamlessly by construction.
@@ -197,6 +278,23 @@ fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
             + 0.18 * (TAU * 110.0 * t).sin() * (0.4 + 0.6 * lfo(3.0))
             + 0.10 * (TAU * 165.0 * t).sin() * lfo(5.0)
     });
+
+    // Black-hole rumble: lowpassed brown noise + a 26Hz throb breathing on a
+    // slow LFO. Loops over 8s (all components integer-cycle); volume rides
+    // the dread level so it creeps in as the day runs out.
+    let mut brown2 = 0.0f32;
+    let mut lp4 = 0.0f32;
+    let dread_loop = loopify(
+        render(8.0, |t, i| {
+            brown2 = (brown2 + 0.10 * noise(i)) * 0.997;
+            lp4 += 0.06 * (brown2 - lp4);
+            let breathe = 0.65 + 0.35 * (TAU * t / 8.0).sin();
+            lp4 * 5.0 * breathe
+                + 0.45 * (TAU * 26.0 * t).sin() * breathe
+                + 0.18 * (TAU * 39.0 * t).sin() * (0.5 + 0.5 * (TAU * 2.0 * t / 8.0).sin())
+        }),
+        4096,
+    );
 
     // Rock break: downward zap + initial crunch.
     let rock_break = render(0.18, |t, i| {
@@ -292,23 +390,6 @@ fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
         lp3 * (1.0 - expd(t, 0.02)) * expd(t, 0.35)
     });
 
-    // Black-hole rumble: lowpassed brown noise + a 26Hz throb breathing on a
-    // slow LFO. Loops over 8s (all components integer-cycle); volume rides
-    // the dread level so it creeps in as the day runs out.
-    let mut brown2 = 0.0f32;
-    let mut lp4 = 0.0f32;
-    let dread_loop = loopify(
-        render(8.0, |t, i| {
-            brown2 = (brown2 + 0.10 * noise(i)) * 0.997;
-            lp4 += 0.06 * (brown2 - lp4);
-            let breathe = 0.65 + 0.35 * (TAU * t / 8.0).sin();
-            lp4 * 5.0 * breathe
-                + 0.45 * (TAU * 26.0 * t).sin() * breathe
-                + 0.18 * (TAU * 39.0 * t).sin() * (0.5 + 0.5 * (TAU * 2.0 * t / 8.0).sin())
-        }),
-        4096,
-    );
-
     // Collapse: a 3s dread riser — pitch and density climbing into the boom.
     let mut lp5 = 0.0f32;
     let collapse = render(3.0, |t, i| {
@@ -354,51 +435,91 @@ fn setup_sfx(mut commands: Commands, mut audio: ResMut<Assets<AudioSource>>) {
         note(392.0, 0.0) + 0.8 * note(523.25, 0.25) + 0.7 * note(659.25, 0.5)
     });
 
-    commands.insert_resource(Sfx {
-        laser_loop: audio.add(wav(laser_loop, 0.8)),
-        jet_loop: audio.add(wav(jet_loop, 0.8)),
-        rock_break: audio.add(wav(rock_break, 0.85)),
-        crystal_break: audio.add(wav(crystal_break, 0.85)),
-        pickup: audio.add(wav(pickup, 0.8)),
-        sell: audio.add(wav(sell, 0.85)),
-        buy: audio.add(wav(buy, 0.8)),
-        deny: audio.add(wav(deny, 0.7)),
-        explosion: audio.add(wav(explosion, 0.95)),
-        plant: audio.add(wav(plant, 0.8)),
-        land: audio.add(wav(land, 0.8)),
-        warp_up: audio.add(wav(warp_up, 0.8)),
-        warp_down: audio.add(wav(warp_down, 0.8)),
-        overheat: audio.add(wav(overheat, 0.8)),
-        vent: audio.add(wav(vent, 0.8)),
-        collapse: audio.add(wav(collapse, 0.9)),
-        consumed: audio.add(wav(consumed, 0.95)),
-        dawn: audio.add(wav(dawn, 0.8)),
-        supernova: audio.add(wav(supernova, 0.95)),
-    });
+    let sfx = Sfx {
+        laser_loop: clip(laser_loop, 0.8),
+        jet_loop: clip(jet_loop, 0.8),
+        drone_loop: clip(drone_loop, 0.7),
+        dread_loop: clip(dread_loop, 0.85),
+        rock_break: clip(rock_break, 0.85),
+        crystal_break: clip(crystal_break, 0.85),
+        pickup: clip(pickup, 0.8),
+        sell: clip(sell, 0.85),
+        buy: clip(buy, 0.8),
+        deny: clip(deny, 0.7),
+        explosion: clip(explosion, 0.95),
+        plant: clip(plant, 0.8),
+        land: clip(land, 0.8),
+        warp_up: clip(warp_up, 0.8),
+        warp_down: clip(warp_down, 0.8),
+        overheat: clip(overheat, 0.8),
+        vent: clip(vent, 0.8),
+        collapse: clip(collapse, 0.9),
+        consumed: clip(consumed, 0.95),
+        dawn: clip(dawn, 0.8),
+        supernova: clip(supernova, 0.95),
+    };
 
-    // The void hum starts immediately and never stops.
-    let drone = audio.add(wav(drone_loop, 0.7));
-    commands.spawn((
-        AudioPlayer::new(drone),
-        PlaybackSettings::LOOP.with_volume(Volume::Linear(0.16)),
-    ));
+    let out = AudioOut::open();
+    let mut loops = Loops::default();
+    start_persistent_loops(&out, &sfx, &mut loops);
 
-    // The black hole's rumble also never stops — it just starts inaudible.
-    let dread = audio.add(wav(dread_loop, 0.85));
-    let e = commands
-        .spawn((
-            AudioPlayer::new(dread),
-            PlaybackSettings::LOOP.with_volume(Volume::Linear(0.0)),
-        ))
-        .id();
-    commands.insert_resource(DreadLoop(e));
+    commands.insert_resource(sfx);
+    commands.insert_resource(out);
+    commands.insert_resource(loops);
 }
+
+/// The void hum and the singularity's rumble start immediately and never
+/// stop (the rumble just starts inaudible). Re-run on every device rebuild.
+fn start_persistent_loops(out: &AudioOut, sfx: &Sfx, loops: &mut Loops) {
+    loops.drone = out.start_loop(&sfx.drone_loop, 0.16);
+    loops.dread = out.start_loop(&sfx.dread_loop, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Device watchdog — the reason this module owns its stream
+// ---------------------------------------------------------------------------
+
+/// Poll the OS default output device every ~1.5s. When it changes (headset
+/// sleeps → fallback to speakers; device returns → follow it back; device
+/// gone entirely → silence until one reappears), rebuild the stream and the
+/// persistent loops. Laser/jet loops respawn on demand from their ctl
+/// systems; in-flight one-shots are simply lost, which nobody notices.
+#[cfg(not(target_arch = "wasm32"))]
+fn audio_watchdog(
+    time: Res<Time>,
+    sfx: Option<Res<Sfx>>,
+    mut out: Option<ResMut<AudioOut>>,
+    mut loops: ResMut<Loops>,
+    mut next_poll: Local<f32>,
+) {
+    let (Some(sfx), Some(out)) = (sfx, out.as_deref_mut()) else {
+        return;
+    };
+    *next_poll -= time.delta_secs();
+    if *next_poll > 0.0 {
+        return;
+    }
+    *next_poll = 1.5;
+    let name = default_device_name();
+    if name == out.device_name {
+        return;
+    }
+    // Default output changed under us: move there.
+    *out = AudioOut::open();
+    loops.stop_all();
+    start_persistent_loops(out, &sfx, &mut loops);
+}
+
+/// Browsers route audio through WebAudio, which survives device changes on
+/// its own — no watchdog needed (and cpal device enumeration is a stub there).
+#[cfg(target_arch = "wasm32")]
+fn audio_watchdog() {}
 
 // ---------------------------------------------------------------------------
 // Playback
 // ---------------------------------------------------------------------------
 
-fn play_queued(mut queue: ResMut<SfxQueue>, sfx: Res<Sfx>, mut commands: Commands) {
+fn play_queued(mut queue: ResMut<SfxQueue>, sfx: Res<Sfx>, out: Res<AudioOut>) {
     for e in queue.0.drain(..) {
         let (handle, vol, speed) = match e {
             SfxEvent::Break { crystal, pitch } => (
@@ -422,12 +543,7 @@ fn play_queued(mut queue: ResMut<SfxQueue>, sfx: Res<Sfx>, mut commands: Command
             SfxEvent::Dawn => (&sfx.dawn, 0.55, 1.0),
             SfxEvent::Supernova => (&sfx.supernova, 0.9, 1.0),
         };
-        commands.spawn((
-            AudioPlayer::new(handle.clone()),
-            PlaybackSettings::DESPAWN
-                .with_volume(Volume::Linear(vol))
-                .with_speed(speed),
-        ));
+        out.play(handle, vol, speed);
     }
 }
 
@@ -435,30 +551,32 @@ fn play_queued(mut queue: ResMut<SfxQueue>, sfx: Res<Sfx>, mut commands: Command
 fn laser_loop_ctl(
     laser: Res<LaserState>,
     sfx: Res<Sfx>,
-    mut handle: Local<Option<Entity>>,
-    mut sinks: Query<&mut AudioSink>,
-    mut commands: Commands,
+    out: Res<AudioOut>,
+    mut loops: ResMut<Loops>,
 ) {
-    match (*handle, laser.firing) {
+    match (&loops.laser, laser.firing) {
         (None, true) => {
-            *handle = Some(
-                commands
-                    .spawn((
-                        AudioPlayer::new(sfx.laser_loop.clone()),
-                        PlaybackSettings::LOOP.with_volume(Volume::Linear(0.35)),
-                    ))
-                    .id(),
-            );
+            loops.laser = out.start_loop(&sfx.laser_loop, 0.35);
         }
-        (Some(e), true) => {
-            // Sink appears a frame or two after spawn; ignore until then.
-            if let Ok(sink) = sinks.get_mut(e) {
-                sink.set_speed(0.85 + laser.heat * 0.6);
-            }
+        (Some(sink), true) => {
+            sink.set_speed(0.85 + laser.heat * 0.6);
         }
-        (Some(e), false) => {
-            commands.entity(e).despawn();
-            *handle = None;
+        (Some(_), false) => {
+            loops.laser = None;
+        }
+        (None, false) => {}
+    }
+}
+
+/// Same idea for the jetpack roar.
+fn jet_loop_ctl(jet: Res<JetState>, sfx: Res<Sfx>, out: Res<AudioOut>, mut loops: ResMut<Loops>) {
+    match (&loops.jet, jet.0) {
+        (None, true) => {
+            loops.jet = out.start_loop(&sfx.jet_loop, 0.3);
+        }
+        (Some(_), true) => {}
+        (Some(_), false) => {
+            loops.jet = None;
         }
         (None, false) => {}
     }
@@ -466,45 +584,10 @@ fn laser_loop_ctl(
 
 /// The rumble loop's volume and pitch ride the published dread level —
 /// silence at dawn, chest-cavity throb at the horizon.
-fn dread_loop_ctl(
-    bh: Res<crate::blackhole::BlackHole>,
-    handle: Option<Res<DreadLoop>>,
-    mut sinks: Query<&mut AudioSink>,
-) {
-    let Some(handle) = handle else { return };
-    if let Ok(mut sink) = sinks.get_mut(handle.0) {
+fn dread_loop_ctl(bh: Res<crate::blackhole::BlackHole>, loops: Res<Loops>) {
+    if let Some(sink) = &loops.dread {
         let d = bh.dread.clamp(0.0, 1.0);
-        sink.set_volume(Volume::Linear(0.65 * d * d));
+        sink.set_volume(0.65 * d * d);
         sink.set_speed(0.9 + 0.35 * d);
     }
-}
-
-/// Same idea for the jetpack roar.
-fn jet_loop_ctl(
-    jet: Res<JetState>,
-    sfx: Res<Sfx>,
-    mut handle: Local<Option<Entity>>,
-    mut sinks: Query<&mut AudioSink>,
-    mut commands: Commands,
-) {
-    match (*handle, jet.0) {
-        (None, true) => {
-            *handle = Some(
-                commands
-                    .spawn((
-                        AudioPlayer::new(sfx.jet_loop.clone()),
-                        PlaybackSettings::LOOP.with_volume(Volume::Linear(0.3)),
-                    ))
-                    .id(),
-            );
-        }
-        (Some(_), true) => {}
-        (Some(e), false) => {
-            commands.entity(e).despawn();
-            *handle = None;
-        }
-        (None, false) => {}
-    }
-    // Quiet the borrow checker about the unused query on the no-op arms.
-    let _ = &mut sinks;
 }
