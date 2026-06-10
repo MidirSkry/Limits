@@ -1,38 +1,45 @@
 //! HUD + floating combat text.
 //!
-//! Styled panels (dark translucent, bordered, rounded): a stats panel, a
-//! reticle with a target name + HP bar, a laser heat bar that lives under the
-//! crosshair, a depot panel near the pad, a status toast, and a controls
-//! hint. Plus world-anchored float text (damage numbers, credit pops). A few
-//! dozen UI entities, so per-frame `format!` is fine here.
+//! Cockpit-style layout: a slim status bar across the top (credits · range /
+//! sector · speed), a reticle with heat bar + charge pips under it, a target
+//! panel, a per-row depot panel with affordability coloring, a status toast,
+//! a controls hint, and a screen-edge nav marker pointing home to the depot.
+//! Plus world-anchored float text (damage numbers, credit pops). A few dozen
+//! UI entities, so per-frame `format!` is fine here.
 
 use bevy::prelude::*;
 
-use crate::game::{Inventory, NearShop, StatusMsg, Upgrades, Wallet, RECALL_COST};
+use crate::game::{shop_pos, Inventory, NearShop, StatusMsg, Upgrades, Wallet, RECALL_COST};
 use crate::player::{Focused, LaserState, PlayerState, TargetInfo};
-use crate::world::loot_name;
+use crate::world::{loot_name, TIER_M};
 
 // ---------------------------------------------------------------------------
 // Palette
 // ---------------------------------------------------------------------------
 
-const PANEL_BG: Color = Color::srgba(0.03, 0.05, 0.08, 0.82);
-const PANEL_BORDER: Color = Color::srgba(0.25, 0.65, 0.80, 0.50);
+const PANEL_BG: Color = Color::srgba(0.03, 0.05, 0.08, 0.80);
+const PANEL_BORDER: Color = Color::srgba(0.25, 0.65, 0.80, 0.45);
 const CREDITS: Color = Color::srgb(0.55, 1.0, 0.85);
 const CYAN: Color = Color::srgb(0.45, 0.9, 1.0);
 const GOLD: Color = Color::srgb(1.0, 0.84, 0.30);
 const TEXT_DIM: Color = Color::srgb(0.75, 0.84, 0.90);
 const TEXT_FAINT: Color = Color::srgb(0.50, 0.60, 0.68);
 const BAR_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.55);
+const AFFORD: Color = Color::srgb(0.55, 1.0, 0.75);
+const TOO_RICH: Color = Color::srgb(0.55, 0.58, 0.64);
 
 // ---------------------------------------------------------------------------
 // Markers
 // ---------------------------------------------------------------------------
 
 #[derive(Component)]
-struct MoneyText;
+struct CreditsText;
 #[derive(Component)]
-struct StatsDetailText;
+struct RangeText;
+#[derive(Component)]
+struct SpeedText;
+#[derive(Component)]
+struct HoldText;
 #[derive(Component)]
 struct TargetPanel;
 #[derive(Component)]
@@ -46,15 +53,20 @@ struct HeatBarFill;
 #[derive(Component)]
 struct HeatWarnText;
 #[derive(Component)]
-struct ShopPanel;
+struct ChargePips;
 #[derive(Component)]
-struct ShopBodyText;
+struct ShopPanel;
+/// One purchasable line in the depot panel; index keys the updater.
+#[derive(Component)]
+struct ShopRow(usize);
 #[derive(Component)]
 struct StatusPanel;
 #[derive(Component)]
 struct StatusText;
 #[derive(Component)]
 struct ControlsText;
+#[derive(Component)]
+struct NavMarker;
 
 /// World-anchored floating text. Lives on a UI Text node; the animate system
 /// projects `world_pos` to the screen each frame and fades it out.
@@ -73,12 +85,13 @@ impl Plugin for HudPlugin {
         app.add_systems(Startup, setup_hud).add_systems(
             Update,
             (
-                hud_stats,
+                hud_top_bar,
                 hud_target,
                 hud_heat,
                 hud_shop,
                 hud_status,
                 hud_controls,
+                hud_nav_marker,
                 animate_float_text,
             ),
         );
@@ -98,33 +111,49 @@ fn font(size: f32) -> TextFont {
 // ---------------------------------------------------------------------------
 
 fn setup_hud(mut commands: Commands) {
-    // --- Stats panel (top-left) ---------------------------------------------
+    // --- Top status bar -------------------------------------------------------
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(12.0),
-                left: Val::Px(12.0),
-                flex_direction: FlexDirection::Column,
-                min_width: Val::Px(220.0),
-                padding: UiRect::all(Val::Px(12.0)),
+                top: Val::Px(10.0),
+                left: Val::Px(10.0),
+                right: Val::Px(10.0),
+                padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
                 border: UiRect::all(Val::Px(1.5)),
-                row_gap: Val::Px(2.0),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(18.0),
                 border_radius: BorderRadius::all(Val::Px(10.0)),
                 ..default()
             },
             BackgroundColor(PANEL_BG),
             BorderColor::all(PANEL_BORDER),
         ))
-        .with_children(|p| {
-            p.spawn((Text::new("0 cr"), font(28.0), TextColor(CREDITS), MoneyText));
-            p.spawn((
+        .with_children(|bar| {
+            bar.spawn((Text::new("0 cr"), font(24.0), TextColor(CREDITS), CreditsText));
+            bar.spawn((
                 Text::new(""),
-                font(15.0),
+                font(16.0),
                 TextColor(TEXT_DIM),
-                StatsDetailText,
+                RangeText,
             ));
+            bar.spawn((Text::new(""), font(16.0), TextColor(CYAN), SpeedText));
         });
+
+    // --- Hold summary (bottom-left, above controls) ---------------------------
+    commands.spawn((
+        Text::new(""),
+        font(14.0),
+        TextColor(TEXT_DIM),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(34.0),
+            left: Val::Px(12.0),
+            ..default()
+        },
+        HoldText,
+    ));
 
     // --- Crosshair reticle (true center) ------------------------------------
     commands
@@ -149,7 +178,7 @@ fn setup_hud(mut commands: Commands) {
             ));
         });
 
-    // --- Laser heat bar (just under the reticle) ----------------------------
+    // --- Heat bar + charge pips (just under the reticle) ----------------------
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
@@ -163,8 +192,8 @@ fn setup_hud(mut commands: Commands) {
         .with_children(|col| {
             col.spawn((
                 Node {
-                    width: Val::Px(120.0),
-                    height: Val::Px(6.0),
+                    width: Val::Px(140.0),
+                    height: Val::Px(7.0),
                     border: UiRect::all(Val::Px(1.0)),
                     border_radius: BorderRadius::all(Val::Px(3.0)),
                     ..default()
@@ -193,13 +222,19 @@ fn setup_hud(mut commands: Commands) {
                 Visibility::Hidden,
                 HeatWarnText,
             ));
+            col.spawn((
+                Text::new(""),
+                font(13.0),
+                TextColor(Color::srgb(0.9, 0.4, 1.0)),
+                ChargePips,
+            ));
         });
 
-    // --- Target panel (below the heat bar) -----------------------------------
+    // --- Target panel (below the heat cluster) --------------------------------
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
-            top: Val::Percent(57.0),
+            top: Val::Percent(58.5),
             width: Val::Percent(100.0),
             justify_content: JustifyContent::Center,
             ..default()
@@ -254,19 +289,19 @@ fn setup_hud(mut commands: Commands) {
             });
         });
 
-    // --- Depot panel (right, vertically centered) ----------------------------
+    // --- Depot panel (right, vertically centered, one row per item) -----------
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Percent(50.0),
                 right: Val::Px(16.0),
-                margin: UiRect::top(Val::Px(-140.0)),
+                margin: UiRect::top(Val::Px(-150.0)),
                 flex_direction: FlexDirection::Column,
-                width: Val::Px(350.0),
+                width: Val::Px(370.0),
                 padding: UiRect::all(Val::Px(14.0)),
                 border: UiRect::all(Val::Px(1.5)),
-                row_gap: Val::Px(6.0),
+                row_gap: Val::Px(7.0),
                 border_radius: BorderRadius::all(Val::Px(10.0)),
                 ..default()
             },
@@ -277,12 +312,9 @@ fn setup_hud(mut commands: Commands) {
         ))
         .with_children(|p| {
             p.spawn((Text::new("◇ SUPPLY DEPOT"), font(20.0), TextColor(CYAN)));
-            p.spawn((
-                Text::new(""),
-                font(15.0),
-                TextColor(TEXT_DIM),
-                ShopBodyText,
-            ));
+            for i in 0..6 {
+                p.spawn((Text::new(""), font(15.0), TextColor(TEXT_DIM), ShopRow(i)));
+            }
         });
 
     // --- Status toast (bottom-center) ---------------------------------------
@@ -330,6 +362,19 @@ fn setup_hud(mut commands: Commands) {
         },
         ControlsText,
     ));
+
+    // --- Depot nav marker (screen-space, repositioned every frame) ------------
+    commands.spawn((
+        Text::new("⌂"),
+        font(20.0),
+        TextColor(Color::srgba(0.45, 0.9, 1.0, 0.85)),
+        Node {
+            position_type: PositionType::Absolute,
+            ..default()
+        },
+        Visibility::Hidden,
+        NavMarker,
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -351,36 +396,53 @@ fn commas(n: u64) -> String {
     out
 }
 
-fn hud_stats(
+fn roman(n: i32) -> String {
+    const R: [&str; 10] = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"];
+    if (1..=10).contains(&n) {
+        R[(n - 1) as usize].to_string()
+    } else {
+        n.to_string()
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn hud_top_bar(
     wallet: Res<Wallet>,
     inventory: Res<Inventory>,
-    upgrades: Res<Upgrades>,
     player: Res<PlayerState>,
-    mut money_q: Query<&mut Text, (With<MoneyText>, Without<StatsDetailText>)>,
-    mut detail_q: Query<&mut Text, (With<StatsDetailText>, Without<MoneyText>)>,
+    mut q: ParamSet<(
+        Query<&mut Text, With<CreditsText>>,
+        Query<&mut Text, With<RangeText>>,
+        Query<&mut Text, With<SpeedText>>,
+        Query<&mut Text, With<HoldText>>,
+    )>,
 ) {
-    if let Ok(mut money) = money_q.single_mut() {
-        money.0 = format!("{} cr", commas(wallet.credits));
+    if let Ok(mut t) = q.p0().single_mut() {
+        t.0 = format!("{} cr", commas(wallet.credits));
     }
-    let Ok(mut detail) = detail_q.single_mut() else {
-        return;
-    };
-    let mut s = format!(
-        "Depth {depth:.1} m   ·   best {best:.1} m\n\
-         Laser  {dps:.0} DPS   ·   charges ×{charges}\n\
-         Hold  {units} units  ({val} cr)",
-        depth = player.depth_m(),
-        best = player.max_depth,
-        dps = upgrades.dps(),
-        charges = upgrades.charges,
-        units = inventory.units,
-        val = commas(inventory.total_value()),
-    );
-    // A few most-valuable stacks, so the readout stays compact.
-    for (&(id, band), &count) in inventory.stacks.iter().rev().take(5) {
-        s.push_str(&format!("\n  {} ×{}", loot_name(id, band), count));
+    if let Ok(mut t) = q.p1().single_mut() {
+        let sector = (player.range_m() / TIER_M) as i32 + 1;
+        t.0 = format!(
+            "RANGE {:.0} m   ·   BEST {:.0} m   ·   SECTOR {}",
+            player.range_m(),
+            player.max_range,
+            roman(sector),
+        );
     }
-    detail.0 = s;
+    if let Ok(mut t) = q.p2().single_mut() {
+        t.0 = format!("{:5.1} m/s", player.vel.length());
+    }
+    if let Ok(mut t) = q.p3().single_mut() {
+        let mut s = format!(
+            "HOLD  {} units  ({} cr)",
+            inventory.units,
+            commas(inventory.total_value())
+        );
+        for (&(id, tier), &count) in inventory.stacks.iter().rev().take(3) {
+            s.push_str(&format!("   ·  {} ×{}", loot_name(id, tier), count));
+        }
+        t.0 = s;
+    }
 }
 
 fn hud_target(
@@ -419,11 +481,14 @@ fn hud_target(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn hud_heat(
     laser: Res<LaserState>,
+    upgrades: Res<Upgrades>,
     mut bar_q: Query<&mut Visibility, (With<HeatBar>, Without<HeatWarnText>)>,
     mut fill_q: Query<(&mut Node, &mut BackgroundColor), With<HeatBarFill>>,
     mut warn_q: Query<&mut Visibility, (With<HeatWarnText>, Without<HeatBar>)>,
+    mut pips_q: Query<&mut Text, With<ChargePips>>,
 ) {
     if let Ok(mut vis) = bar_q.single_mut() {
         *vis = if laser.heat > 0.02 {
@@ -451,6 +516,17 @@ fn hud_heat(
             Visibility::Hidden
         };
     }
+    if let Ok(mut pips) = pips_q.single_mut() {
+        let n = upgrades.charges.min(10) as usize;
+        let mut s = String::with_capacity(24);
+        for _ in 0..n {
+            s.push('◆');
+        }
+        if upgrades.charges > 10 {
+            s.push_str(&format!(" +{}", upgrades.charges - 10));
+        }
+        pips.0 = s;
+    }
 }
 
 fn hud_shop(
@@ -459,7 +535,7 @@ fn hud_shop(
     inventory: Res<Inventory>,
     upgrades: Res<Upgrades>,
     mut panel_q: Query<&mut Visibility, With<ShopPanel>>,
-    mut body_q: Query<&mut Text, With<ShopBodyText>>,
+    mut rows: Query<(&ShopRow, &mut Text, &mut TextColor)>,
 ) {
     let Ok(mut vis) = panel_q.single_mut() else {
         return;
@@ -469,50 +545,74 @@ fn hud_shop(
         return;
     }
     *vis = Visibility::Visible;
-    let Ok(mut body) = body_q.single_mut() else {
-        return;
-    };
 
-    let tag = |cost: u64| -> &'static str {
-        if wallet.credits >= cost {
-            ""
-        } else {
-            "  ✗"
-        }
-    };
-    let recall_line = if upgrades.recall {
-        "[4]  Recall rig — OWNED".to_string()
-    } else {
-        format!(
-            "[4]  Recall rig   {}{}",
-            commas(RECALL_COST),
-            tag(RECALL_COST)
-        )
-    };
-    body.0 = format!(
-        "[E]  Sell hold   +{sell} cr\n\
-         [1]  Laser output  {dps:.0} → {dps_next:.0} DPS   {p_cost}{t1}\n\
-         [2]  Coolant loop  lv{cool}   {c_cost}{t2}\n\
-         [3]  Tractor field  {mag:.1} → {mag_next:.1} m   {tr_cost}{t3}\n\
-         {recall_line}\n\
-         [5]  Plasma charges ×{pack}   {pl_cost}{t5}   (held: {held})",
-        sell = commas(inventory.total_value()),
-        dps = upgrades.dps(),
-        dps_next = upgrades.dps() * 1.5,
-        p_cost = commas(upgrades.power_cost()),
-        t1 = tag(upgrades.power_cost()),
-        cool = upgrades.coolant_lvl + 1,
-        c_cost = commas(upgrades.coolant_cost()),
-        t2 = tag(upgrades.coolant_cost()),
-        mag = upgrades.magnet_range(),
-        mag_next = upgrades.magnet_range() + 0.8,
-        tr_cost = commas(upgrades.tractor_cost()),
-        t3 = tag(upgrades.tractor_cost()),
-        pack = crate::game::PLASMA_PACK_SIZE,
-        pl_cost = commas(upgrades.plasma_cost()),
-        t5 = tag(upgrades.plasma_cost()),
-        held = upgrades.charges,
-    );
+    for (row, mut text, mut color) in &mut rows {
+        let (line, affordable) = match row.0 {
+            0 => (
+                format!("[E]  Sell hold    +{} cr", commas(inventory.total_value())),
+                inventory.units > 0,
+            ),
+            1 => {
+                let cost = upgrades.power_cost();
+                (
+                    format!(
+                        "[1]  Laser output   {:.0} → {:.0} DPS    {} cr",
+                        upgrades.dps(),
+                        upgrades.dps() * 1.5,
+                        commas(cost)
+                    ),
+                    wallet.credits >= cost,
+                )
+            }
+            2 => {
+                let cost = upgrades.coolant_cost();
+                (
+                    format!(
+                        "[2]  Coolant loop   lv{}    {} cr",
+                        upgrades.coolant_lvl + 1,
+                        commas(cost)
+                    ),
+                    wallet.credits >= cost,
+                )
+            }
+            3 => {
+                let cost = upgrades.tractor_cost();
+                (
+                    format!(
+                        "[3]  Tractor field   {:.1} → {:.1} m    {} cr",
+                        upgrades.magnet_range(),
+                        upgrades.magnet_range() + 0.8,
+                        commas(cost)
+                    ),
+                    wallet.credits >= cost,
+                )
+            }
+            4 => {
+                if upgrades.recall {
+                    ("[4]  Recall rig — OWNED".to_string(), false)
+                } else {
+                    (
+                        format!("[4]  Recall rig    {} cr", commas(RECALL_COST)),
+                        wallet.credits >= RECALL_COST,
+                    )
+                }
+            }
+            _ => {
+                let cost = upgrades.plasma_cost();
+                (
+                    format!(
+                        "[5]  Plasma charges ×{}    {} cr    (held {})",
+                        crate::game::PLASMA_PACK_SIZE,
+                        commas(cost),
+                        upgrades.charges
+                    ),
+                    wallet.credits >= cost,
+                )
+            }
+        };
+        text.0 = line;
+        color.0 = if affordable { AFFORD } else { TOO_RICH };
+    }
 }
 
 fn hud_status(
@@ -542,12 +642,58 @@ fn hud_controls(
     text.0 = if !focused.0 {
         "Click to take the controls".to_string()
     } else if upgrades.recall {
-        "WASD move · Space jump/jetpack · LMB laser · Q plasma charge · T surface · G dive · Esc release"
+        "WASD thrust · Space up · C down · Shift brake · LMB laser · Q charge · T home · G far site · Esc release"
             .to_string()
     } else {
-        "WASD move · Space jump/jetpack · LMB laser · Q plasma charge · Esc release"
+        "WASD thrust · Space up · C down · Shift brake · LMB laser · Q charge · Esc release"
             .to_string()
     };
+}
+
+/// Point home: a ⌂ marker pinned to the depot, clamped to the screen edge
+/// when it's off-camera. Hidden once you're close enough to see the pad.
+fn hud_nav_marker(
+    player: Res<PlayerState>,
+    cameras: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    mut markers: Query<(&mut Node, &mut Visibility, &mut Text), With<NavMarker>>,
+) {
+    let Ok((camera, cam_tf)) = cameras.single() else {
+        return;
+    };
+    let Ok((mut node, mut vis, mut text)) = markers.single_mut() else {
+        return;
+    };
+    let target = shop_pos() + Vec3::Y * 1.5;
+    let dist = player.pos.distance(target);
+    if dist < 12.0 {
+        *vis = Visibility::Hidden;
+        return;
+    }
+    *vis = Visibility::Visible;
+    text.0 = format!("⌂ {:.0}m", dist);
+
+    let Some(view_size) = camera.logical_viewport_size() else {
+        return;
+    };
+    let center = view_size * 0.5;
+    let margin = 56.0;
+
+    match camera.world_to_viewport(cam_tf, target) {
+        Ok(screen) => {
+            // On screen (or near it): clamp into the visible frame.
+            node.left = Val::Px(screen.x.clamp(margin, view_size.x - margin));
+            node.top = Val::Px(screen.y.clamp(margin, view_size.y - margin));
+        }
+        Err(_) => {
+            // Behind the camera: project the direction into view space and
+            // pin the marker to the screen edge it's closest to.
+            let local = cam_tf.affine().inverse().transform_point3(target);
+            let dir2 = Vec2::new(local.x, -local.y).normalize_or_zero();
+            let pos = center + dir2 * (center.min_element() - margin);
+            node.left = Val::Px(pos.x.clamp(margin, view_size.x - margin));
+            node.top = Val::Px(pos.y.clamp(margin, view_size.y - margin));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

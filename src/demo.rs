@@ -1,9 +1,11 @@
 //! Scripted demo mode for hands-off verification (native only).
 //!
-//! `LIMITS_DEMO=1` drives the player through a fixed tour — admire the sky,
-//! lase the ground, set off a plasma charge, jetpack out, visit the depot —
-//! and saves screenshots into `shots/` at key beats. Combine with
-//! `LIMITS_BENCH_EXIT_AFTER=26` for a self-terminating visual smoke test.
+//! `LIMITS_DEMO=1` drives the player through a fixed tour of the open world —
+//! admire the sky, lase the home rock to overheat, lift off and FLY to the
+//! nearest neighboring asteroid, torpedo it with a plasma charge, then fly
+//! home to the depot and sell — saving screenshots into `shots/` at key
+//! beats. Combine with `LIMITS_BENCH_EXIT_AFTER=50` for a self-terminating
+//! visual smoke test.
 //!
 //! Input is injected by pressing the real `ButtonInput` resources before the
 //! gameplay systems run (this plugin's system is ordered before
@@ -34,9 +36,14 @@ impl Plugin for DemoPlugin {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct DemoState {
-    shots_taken: u32,
+    target: Option<(Vec3, f32)>, // neighbor asteroid (center, reach)
+    arrived_at: Option<f32>,
+    bombed_at: Option<f32>,
+    heading_home_at: Option<f32>,
+    sold_at: Option<f32>,
     q_fired: bool,
     e_fired: bool,
+    shots_done: u32,
 }
 
 /// Ease an angle toward a target along the shortest arc. The wrap matters:
@@ -54,6 +61,14 @@ fn ease_angle(current: f32, target: f32, dt: f32) -> f32 {
     current + delta * (dt * 4.0).min(1.0)
 }
 
+/// Yaw/pitch that point the camera along `dir`.
+#[cfg(not(target_arch = "wasm32"))]
+fn aim(dir: Vec3) -> (f32, f32) {
+    let yaw = f32::atan2(-dir.x, -dir.z);
+    let pitch = (dir.y / dir.length().max(1e-5)).clamp(-1.0, 1.0).asin();
+    (yaw, pitch)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn run_demo(
@@ -69,117 +84,157 @@ fn run_demo(
     let dt = time.delta_secs();
     focused.0 = true;
 
-    // Where the depot is, for the final walk. Horizontal distance only —
-    // a falling player passing over the pad still counts as arriving.
-    let to_shop = shop_pos() - player.pos;
+    // Pick the flight target once: the nearest non-home asteroid.
+    if state.target.is_none() {
+        if let Some(a) = crate::world::nearest_asteroid(player.pos, true) {
+            state.target = Some((a.center, a.reach()));
+            eprintln!(
+                "[demo] target asteroid at ({:.0},{:.0},{:.0}) r~{:.0} dist {:.0}m",
+                a.center.x,
+                a.center.y,
+                a.center.z,
+                a.reach(),
+                (a.center - player.pos).length()
+            );
+        }
+    }
+    let (target_c, target_r) = state.target.unwrap_or((Vec3::new(60.0, 0.0, 60.0), 8.0));
+    let to_target = target_c - player.eye();
+    let target_dist = to_target.length() - target_r; // to the surface-ish
+    let to_shop = shop_pos() + Vec3::Y * 1.0 - player.pos;
     let shop_dist = Vec2::new(to_shop.x, to_shop.z).length();
-    let shop_yaw = f32::atan2(-to_shop.x, -to_shop.z);
 
-    // --- The tour script, keyed on elapsed seconds --------------------------
+    // --- Look script -----------------------------------------------------------
     let (yaw_t, pitch_t) = if t < 3.0 {
-        // Slow pan across the sky.
-        (t * 0.55, 0.10)
+        (t * 0.55, 0.10) // sky pan
     } else if t < 5.0 {
-        // Face the gas giant (it sits along -X,-Z at modest elevation).
-        (0.64, 0.18)
-    } else if t < 12.0 {
-        // Look at the ground in front and mine (long enough to overheat).
-        (0.64, -0.95)
-    } else if t < 16.2 {
-        // Aim straight down: the plasma charge goes under our own feet.
-        (0.64, -1.40)
-    } else if t < 19.5 {
-        // We fell into the crater — pan around the glowing walls.
-        ((t - 16.2) * 0.8 + 0.64, -0.15)
-    } else if t < 23.0 {
-        // Jetpack out, drifting toward the depot so we land shop-side.
-        (shop_yaw, -0.05)
+        (0.64, 0.18) // gas giant
+    } else if t < 11.0 {
+        (0.64, -0.95) // mine the ground (long enough to overheat)
+    } else if state.bombed_at.is_none() || state.heading_home_at.is_none() {
+        // Aim at the neighbor rock: for the flight, the charge throw, and
+        // watching the boom.
+        aim(to_target.normalize_or_zero())
     } else {
-        // Walk to the depot.
-        (shop_yaw, -0.25)
+        // Homeward: look at the depot.
+        aim((shop_pos() + Vec3::Y * 1.0 - player.eye()).normalize_or_zero())
     };
     player.yaw = ease_angle(player.yaw, yaw_t, dt);
     player.pitch = ease_angle(player.pitch, pitch_t, dt);
 
-    // Trigger + movement per phase.
+    // --- Inputs ------------------------------------------------------------------
     mouse.release(MouseButton::Left);
     keys.release(KeyCode::KeyW);
     keys.release(KeyCode::KeyS);
     keys.release(KeyCode::Space);
+    keys.release(KeyCode::ShiftLeft);
 
-    match t {
-        t if (5.0..13.5).contains(&t) => {
-            mouse.press(MouseButton::Left);
-            // Shuffle forward onto fresh rock now and then.
-            if (8.0..8.6).contains(&t) || (11.0..11.5).contains(&t) {
-                keys.press(KeyCode::KeyW);
+    if (5.0..10.5).contains(&t) {
+        // Mine the home rock at our feet.
+        mouse.press(MouseButton::Left);
+    } else if (11.0..50.0).contains(&t) && state.arrived_at.is_none() {
+        // FLY: lift off, then thrust along the look ray toward the target.
+        if t < 12.0 {
+            keys.press(KeyCode::Space);
+        }
+        if target_dist > 3.0 {
+            keys.press(KeyCode::KeyW);
+            // Don't slam into it: bleed speed on final approach.
+            if target_dist < 12.0 && player.vel.length() > 8.0 {
+                keys.press(KeyCode::ShiftLeft);
+            }
+        } else {
+            keys.press(KeyCode::ShiftLeft); // brake at the rock
+            if player.vel.length() < 1.0 {
+                state.arrived_at = Some(t);
+                eprintln!("[demo] arrived at neighbor t={t:.1}");
             }
         }
-        t if (14.0..14.1).contains(&t) => {
-            if !state.q_fired {
+    } else if let Some(arrived) = state.arrived_at {
+        if state.bombed_at.is_none() {
+            // Hover-mine the face for a moment, then torpedo it.
+            if t < arrived + 2.0 {
+                mouse.press(MouseButton::Left);
+                keys.press(KeyCode::ShiftLeft);
+            } else if !state.q_fired {
                 state.q_fired = true;
                 keys.release(KeyCode::KeyQ);
                 keys.press(KeyCode::KeyQ);
+                state.bombed_at = Some(t);
+                eprintln!("[demo] charge away t={t:.1}");
             }
-        }
-        t if (19.5..23.0).contains(&t) => {
-            keys.press(KeyCode::Space); // jetpack out of the crater...
-            if t >= 21.0 {
-                keys.press(KeyCode::KeyW); // ...drifting toward the rim
-            }
-        }
-        t if t >= 23.0 => {
-            if shop_dist > 1.2 {
+        } else if let Some(bombed) = state.bombed_at {
+            if t < bombed + 1.6 {
+                keys.press(KeyCode::KeyS); // back off and watch
+            } else if t < bombed + 3.4 {
+                keys.press(KeyCode::ShiftLeft); // hold position for the boom
+            } else if state.heading_home_at.is_none() {
+                state.heading_home_at = Some(t);
+                eprintln!("[demo] heading home t={t:.1}");
+            } else if shop_dist > 1.2 {
                 keys.press(KeyCode::KeyW);
-                // Blocked, or fell into a crater? Hop/jet until clear.
-                // Only below surface level, so this can't ride the rim wall.
-                let slow = Vec2::new(player.vel.x, player.vel.z).length() < 0.6;
-                if slow && (player.grounded || player.pos.y < -0.3) {
-                    keys.press(KeyCode::Space);
+                // Bleed speed close-in so we don't faceplant the pad.
+                if to_shop.length() < 12.0 && player.vel.length() > 6.0 {
+                    keys.press(KeyCode::ShiftLeft);
                 }
-            } else if t >= 26.2 && !state.e_fired {
-                // Arrived: sell the hold once.
+            } else if !state.e_fired {
                 state.e_fired = true;
+                state.sold_at = Some(t);
                 keys.release(KeyCode::KeyE);
                 keys.press(KeyCode::KeyE);
+                eprintln!("[demo] sold t={t:.1}");
             }
         }
-        _ => {}
     }
-    if state.e_fired && !(26.2..26.3).contains(&t) {
+    if !state.q_fired || state.bombed_at.is_some_and(|b| t > b + 0.1) {
+        keys.release(KeyCode::KeyQ);
+    }
+    if state.e_fired && state.sold_at.is_some_and(|s| t > s + 0.1) {
         keys.release(KeyCode::KeyE);
     }
 
-    // Once-per-second breadcrumb so a failed tour can be reconstructed from
-    // the log. Demo-only diagnostic; the game itself never prints.
+    // Once-per-second breadcrumb so a failed tour can be reconstructed.
     if (t * 10.0) as u32 % 10 == 0 && (t * 10.0).fract() < dt * 10.0 {
         eprintln!(
-            "[demo] t={t:.0} pos=({:.1},{:.1},{:.1}) yaw={:.2} grounded={}",
-            player.pos.x, player.pos.y, player.pos.z, player.yaw, player.grounded
+            "[demo] t={t:.0} pos=({:.1},{:.1},{:.1}) yaw={:.2} v={:.1} grounded={}",
+            player.pos.x,
+            player.pos.y,
+            player.pos.z,
+            player.yaw,
+            player.vel.length(),
+            player.grounded
         );
     }
-    if !(14.0..14.1).contains(&t) {
-        keys.release(KeyCode::KeyQ);
-    }
 
-    // --- Screenshots at fixed beats ------------------------------------------
-    const SHOTS: [(f32, &str); 8] = [
-        (2.2, "shots/01-surface-sky.png"),
-        (4.5, "shots/02-planet.png"),
-        (6.5, "shots/03-laser.png"),
-        (10.4, "shots/04-overheat.png"),
-        (16.45, "shots/05-explosion.png"),
-        (18.5, "shots/06-crater.png"),
-        (22.0, "shots/07-jetpack.png"),
-        (27.3, "shots/08-depot-sell.png"),
+    // --- Screenshots ---------------------------------------------------------
+    // Fixed beats early; event-relative beats once flight timing is real.
+    // Shot in declared order: the next one fires when its condition is true.
+    let conds: [(bool, &'static str); 8] = [
+        (t >= 2.2, "shots/01-sky.png"),
+        (t >= 4.5, "shots/02-planet.png"),
+        (t >= 6.5, "shots/03-laser.png"),
+        (t >= 10.4, "shots/04-overheat.png"),
+        (t >= 14.5, "shots/05-flight.png"),
+        (
+            state.arrived_at.is_some_and(|a| t >= a + 1.0),
+            "shots/06-neighbor.png",
+        ),
+        (
+            state.bombed_at.is_some_and(|b| t >= b + 2.4),
+            "shots/07-boom.png",
+        ),
+        (
+            state.sold_at.is_some_and(|s| t >= s + 0.7)
+                || state.heading_home_at.is_some_and(|h| t >= h + 14.0),
+            "shots/08-depot.png",
+        ),
     ];
-    if (state.shots_taken as usize) < SHOTS.len() {
-        let (at, path) = SHOTS[state.shots_taken as usize];
-        if t >= at {
-            state.shots_taken += 1;
+    if let Some(&(cond, name)) = conds.get(state.shots_done as usize) {
+        if cond {
+            state.shots_done += 1;
             commands
                 .spawn(Screenshot::primary_window())
-                .observe(save_to_disk(path));
+                .observe(save_to_disk(name));
         }
     }
 }

@@ -1,7 +1,8 @@
 //! The space dressing: a procedurally generated starfield cubemap (milky way
 //! band, nebulae, thousands of stars), an HDR sun, a ringed gas giant, a
-//! moon, twinkling foreground stars, shooting stars, the rocky horizon of the
-//! host asteroid, and headlamp dust motes underground.
+//! moon, twinkling foreground stars, shooting stars, and headlamp dust motes
+//! inside tunnels. Everything parents to a SkyAnchor that follows the player,
+//! so the celestials sit at effective infinity in the open world.
 //!
 //! Everything is generated at startup from hashes — no texture or model
 //! assets. The camera gets Hdr + Bloom + TonyMcMapface here, which is what
@@ -18,8 +19,7 @@ use bevy::render::render_resource::{
 };
 use bevy::render::view::Hdr;
 
-use crate::player::PlayerState;
-use crate::world::{VOXEL, WORLD_VOXELS_XZ};
+use crate::player::{Enclosure, PlayerState};
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -43,11 +43,11 @@ impl Plugin for SkyPlugin {
             next_in: 4.0,
             counter: 0,
         })
-        .add_systems(Startup, (setup_horizon, setup_celestials, setup_dust))
+        .add_systems(Startup, (setup_celestials, setup_dust))
         .add_systems(PostStartup, setup_camera_sky)
         .add_systems(
             Update,
-            (twinkle, shooting_stars, rotate_slow, dust_drift),
+            (anchor_follow, twinkle, shooting_stars, rotate_slow, dust_drift),
         );
     }
 }
@@ -56,9 +56,19 @@ pub fn sun_direction() -> Vec3 {
     SUN_DIR.normalize()
 }
 
-fn claim_center() -> Vec3 {
-    let c = WORLD_VOXELS_XZ as f32 * VOXEL * 0.5;
-    Vec3::new(c, 0.0, c)
+/// Sky furniture (sun, planet, moon, twinkle stars) parents to this anchor,
+/// which tracks the player —so the celestials never get closer no matter
+/// how far you fly. The skybox-at-infinity trick, but for meshes.
+#[derive(Component)]
+pub struct SkyAnchor;
+
+fn anchor_follow(
+    player: Res<PlayerState>,
+    mut anchors: Query<&mut Transform, With<SkyAnchor>>,
+) {
+    for mut tf in &mut anchors {
+        tf.translation = player.pos;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +288,7 @@ fn build_skybox_image() -> Image {
     image
 }
 
-/// PostStartup: the player camera exists now — bolt the space look onto it.
+/// PostStartup: the player camera exists now —bolt the space look onto it.
 fn setup_camera_sky(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -327,71 +337,83 @@ fn setup_celestials(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let center = claim_center();
+    let anchor = commands
+        .spawn((Transform::IDENTITY, Visibility::Visible, SkyAnchor))
+        .id();
 
     // --- The sun: an HDR ball the bloom pass turns into a glare ------------
-    commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(48.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::linear_rgb(40.0, 32.0, 22.0),
-            unlit: true,
-            ..default()
-        })),
-        Transform::from_translation(center + sun_direction() * 1600.0),
-    ));
+    let sun = commands
+        .spawn((
+            Mesh3d(meshes.add(Sphere::new(48.0))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::linear_rgb(40.0, 32.0, 22.0),
+                unlit: true,
+                ..default()
+            })),
+            Transform::from_translation(sun_direction() * 1600.0),
+        ))
+        .id();
 
     // --- Gas giant with rings ----------------------------------------------
-    let planet_pos = center + PLANET_DIR.normalize() * 1800.0;
-    commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(260.0).mesh().uv(64, 32))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color_texture: Some(images.add(gas_giant_texture())),
-            base_color: Color::WHITE,
-            perceptual_roughness: 1.0,
-            // Faint self-light so the night side reads against the void.
-            emissive: LinearRgba::rgb(0.015, 0.018, 0.035),
-            ..default()
-        })),
-        Transform::from_translation(planet_pos)
-            .with_rotation(Quat::from_rotation_z(0.18)),
-        RotateSlow {
-            axis: Vec3::new(0.18, 1.0, 0.0).normalize(),
-            rate: 0.008,
-        },
-    ));
-    commands.spawn((
-        Mesh3d(meshes.add(ring_mesh(360.0, 620.0, 128, |t| {
-            // Banded: alpha pulses with radius, fading at both edges.
-            let bands = (0.5 + 0.5 * (t * 43.0).sin()).powf(1.5);
-            let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
-            let a = 0.05 + 0.30 * bands * edge;
-            [0.75 + 0.2 * t, 0.72, 0.68 - 0.25 * t, a]
-        }))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            unlit: true,
-            alpha_mode: AlphaMode::Add,
-            cull_mode: None,
-            ..default()
-        })),
-        Transform::from_translation(planet_pos).with_rotation(Quat::from_euler(
-            EulerRot::XYZ,
-            0.45,
-            0.05,
-            0.18,
-        )),
-    ));
+    let planet_pos = PLANET_DIR.normalize() * 1800.0;
+    let planet = commands
+        .spawn((
+            Mesh3d(meshes.add(Sphere::new(260.0).mesh().uv(64, 32))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color_texture: Some(images.add(gas_giant_texture())),
+                base_color: Color::WHITE,
+                perceptual_roughness: 1.0,
+                // Faint self-light so the night side reads against the void.
+                emissive: LinearRgba::rgb(0.015, 0.018, 0.035),
+                ..default()
+            })),
+            Transform::from_translation(planet_pos)
+                .with_rotation(Quat::from_rotation_z(0.18)),
+            RotateSlow {
+                axis: Vec3::new(0.18, 1.0, 0.0).normalize(),
+                rate: 0.008,
+            },
+        ))
+        .id();
+    let rings = commands
+        .spawn((
+            Mesh3d(meshes.add(ring_mesh(360.0, 620.0, 128, |t| {
+                // Banded: alpha pulses with radius, fading at both edges.
+                let bands = (0.5 + 0.5 * (t * 43.0).sin()).powf(1.5);
+                let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
+                let a = 0.05 + 0.30 * bands * edge;
+                [0.75 + 0.2 * t, 0.72, 0.68 - 0.25 * t, a]
+            }))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                unlit: true,
+                alpha_mode: AlphaMode::Add,
+                cull_mode: None,
+                ..default()
+            })),
+            Transform::from_translation(planet_pos).with_rotation(Quat::from_euler(
+                EulerRot::XYZ,
+                0.45,
+                0.05,
+                0.18,
+            )),
+        ))
+        .id();
 
     // --- A dead grey moon ----------------------------------------------------
-    commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(46.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.45, 0.44, 0.43),
-            perceptual_roughness: 1.0,
-            ..default()
-        })),
-        Transform::from_translation(center + MOON_DIR.normalize() * 1500.0),
-    ));
+    let moon = commands
+        .spawn((
+            Mesh3d(meshes.add(Sphere::new(46.0))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.45, 0.44, 0.43),
+                perceptual_roughness: 1.0,
+                ..default()
+            })),
+            Transform::from_translation(MOON_DIR.normalize() * 1500.0),
+        ))
+        .id();
+
+    commands.entity(anchor).add_children(&[sun, planet, rings, moon]);
 
     // --- Foreground twinkle stars -------------------------------------------
     let star_mesh = meshes.add(Sphere::new(1.0));
@@ -414,23 +436,25 @@ fn setup_celestials(
     ];
     for i in 0..TWINKLE_STARS {
         let h = |salt: u64| hash1(i as u64 * 7919 ^ salt);
-        // Uniform-ish on the upper sphere (don't bother below the horizon).
-        let z = h(0x1) * 0.92 + 0.06;
+        // All around the sphere now —there's no "below the horizon" in space.
+        let z = h(0x1) * 1.9 - 0.9;
         let a = h(0x2) * std::f32::consts::TAU;
         let r = (1.0 - z * z).max(0.0).sqrt();
         let dir = Vec3::new(r * a.cos(), z, r * a.sin());
         let base = 0.9 + h(0x3) * 2.2;
-        commands.spawn((
-            Mesh3d(star_mesh.clone()),
-            MeshMaterial3d(star_mats[(h(0x4) * 3.0) as usize % 3].clone()),
-            Transform::from_translation(center + dir * 1200.0)
-                .with_scale(Vec3::splat(base)),
-            Twinkle {
-                base,
-                phase: h(0x5) * std::f32::consts::TAU,
-                speed: 1.5 + h(0x6) * 4.0,
-            },
-        ));
+        let star = commands
+            .spawn((
+                Mesh3d(star_mesh.clone()),
+                MeshMaterial3d(star_mats[(h(0x4) * 3.0) as usize % 3].clone()),
+                Transform::from_translation(dir * 1200.0).with_scale(Vec3::splat(base)),
+                Twinkle {
+                    base,
+                    phase: h(0x5) * std::f32::consts::TAU,
+                    speed: 1.5 + h(0x6) * 4.0,
+                },
+            ))
+            .id();
+        commands.entity(anchor).add_child(star);
     }
 }
 
@@ -519,6 +543,7 @@ struct ShootingStar {
 
 fn shooting_stars(
     time: Res<Time>,
+    player: Res<PlayerState>,
     mut clock: ResMut<ShootingStarClock>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -564,12 +589,12 @@ fn shooting_stars(
         })
         .clone();
 
-    // Spawn above the horizon, streaking tangentially.
-    let z = h(0x1) * 0.6 + 0.25;
+    // Spawn anywhere on the sky sphere, streaking tangentially.
+    let z = h(0x1) * 1.6 - 0.8;
     let a = h(0x2) * std::f32::consts::TAU;
     let r = (1.0 - z * z).max(0.0).sqrt();
     let dir = Vec3::new(r * a.cos(), z, r * a.sin());
-    let pos = claim_center() + dir * 1100.0;
+    let pos = player.pos + dir * 1100.0;
     let tangent = dir.cross(Vec3::new(h(0x3) - 0.5, h(0x4) - 0.5, h(0x5) - 0.5).normalize())
         .normalize_or_zero();
     let vel = tangent * (350.0 + h(0x6) * 250.0);
@@ -582,143 +607,8 @@ fn shooting_stars(
 }
 
 // ---------------------------------------------------------------------------
-// Asteroid horizon: a cratered heightfield ring around the claim + boulders
 // ---------------------------------------------------------------------------
-
-/// Host-asteroid terrain height at (x, z), relative to claim center `c`.
-fn terrain_height(x: f32, z: f32, c: Vec3) -> f32 {
-    let dx = x - c.x;
-    let dz = z - c.z;
-    let d = (dx * dx + dz * dz).sqrt();
-    // Blend up from below the claim rim into open terrain.
-    let t = ((d - 14.0) / 26.0).clamp(0.0, 1.0);
-    let t = smooth(t);
-    let ridges = fbm(Vec3::new(x * 0.02, 7.7, z * 0.02), 4, 0x7E11) * 7.0
-        + fbm(Vec3::new(x * 0.09, 3.3, z * 0.09), 3, 0x7E12) * 1.4
-        - 2.8;
-    // Craters: hash-placed bowls with raised rims.
-    let mut crater = 0.0;
-    for i in 0..9u64 {
-        let h = |salt: u64| hash1(i.wrapping_mul(50331653) ^ salt);
-        let ca = h(0x1) * std::f32::consts::TAU;
-        let cd = 45.0 + h(0x2) * 190.0;
-        let cx = c.x + ca.cos() * cd;
-        let cz = c.z + ca.sin() * cd;
-        let radius = 10.0 + h(0x3) * 26.0;
-        let depth = 2.5 + h(0x4) * 5.0;
-        let r = ((x - cx).powi(2) + (z - cz).powi(2)).sqrt();
-        crater += -depth * (-(r / radius).powi(2) * 2.2).exp()
-            + depth * 0.3 * (-((r - radius) / (radius * 0.28)).powi(2)).exp();
-    }
-    // Far edge falls away — fake horizon curvature of the big rock.
-    let fall = -((d - 210.0).max(0.0) * 0.10).powi(2);
-    (-2.5) * (1.0 - t) + (ridges + crater) * t + fall
-}
-
-fn setup_horizon(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let c = claim_center();
-    const N: usize = 110;
-    const HALF: f32 = 290.0;
-    let step = HALF * 2.0 / N as f32;
-
-    let mut positions = Vec::with_capacity((N + 1) * (N + 1));
-    let mut normals = Vec::with_capacity(positions.capacity());
-    let mut colors = Vec::with_capacity(positions.capacity());
-    let mut indices: Vec<u32> = Vec::with_capacity(N * N * 6);
-
-    for gz in 0..=N {
-        for gx in 0..=N {
-            let x = c.x - HALF + gx as f32 * step;
-            let z = c.z - HALF + gz as f32 * step;
-            let y = terrain_height(x, z, c);
-            positions.push([x, y, z]);
-            // Normal from central differences.
-            let e = step * 0.5;
-            let nx = terrain_height(x - e, z, c) - terrain_height(x + e, z, c);
-            let nz = terrain_height(x, z - e, c) - terrain_height(x, z + e, c);
-            let n = Vec3::new(nx, 2.0 * e, nz).normalize();
-            normals.push([n.x, n.y, n.z]);
-            // Regolith grey, lighter on high ground, darker in bowls.
-            let shade = 0.30 + (y * 0.012).clamp(-0.06, 0.08)
-                + 0.05 * hash3(gx as i32, 0, gz as i32, 0xC0C0);
-            colors.push([shade, shade * 0.97, shade * 0.92, 1.0]);
-        }
-    }
-    let stride = (N + 1) as u32;
-    for gz in 0..N as u32 {
-        for gx in 0..N as u32 {
-            let i = gz * stride + gx;
-            indices.extend_from_slice(&[
-                i,
-                i + stride,
-                i + 1,
-                i + 1,
-                i + stride,
-                i + stride + 1,
-            ]);
-        }
-    }
-    let mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    .with_inserted_indices(Indices::U32(indices));
-
-    let terrain_mat = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 1.0,
-        ..default()
-    });
-    commands.spawn((
-        Mesh3d(meshes.add(mesh)),
-        MeshMaterial3d(terrain_mat.clone()),
-        Transform::IDENTITY,
-    ));
-
-    // Boulders strewn across the field.
-    let boulder_mesh = meshes.add(Sphere::new(1.0).mesh().ico(2).unwrap());
-    let boulder_mats: Vec<_> = [0.26f32, 0.31, 0.36, 0.22]
-        .iter()
-        .map(|&g| {
-            materials.add(StandardMaterial {
-                base_color: Color::srgb(g, g * 0.97, g * 0.93),
-                perceptual_roughness: 1.0,
-                ..default()
-            })
-        })
-        .collect();
-    for i in 0..80u64 {
-        let h = |salt: u64| hash1(i.wrapping_mul(2246822519) ^ salt);
-        let a = h(0x1) * std::f32::consts::TAU;
-        let d = 24.0 + h(0x2) * 230.0;
-        let x = c.x + a.cos() * d;
-        let z = c.z + a.sin() * d;
-        let s = 0.5 + h(0x3).powi(2) * 4.5;
-        let y = terrain_height(x, z, c) + s * 0.25;
-        commands.spawn((
-            Mesh3d(boulder_mesh.clone()),
-            MeshMaterial3d(boulder_mats[(h(0x4) * 4.0) as usize % 4].clone()),
-            Transform::from_xyz(x, y, z)
-                .with_scale(Vec3::new(s, s * (0.55 + h(0x5) * 0.5), s * (0.8 + h(0x6) * 0.4)))
-                .with_rotation(Quat::from_euler(
-                    EulerRot::XYZ,
-                    h(0x7) * 0.6,
-                    h(0x8) * std::f32::consts::TAU,
-                    h(0x9) * 0.6,
-                )),
-        ));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Dust motes — drifting specks in the headlamp beam underground
+// Dust motes —drifting specks in the headlamp beam underground
 // ---------------------------------------------------------------------------
 
 #[derive(Component)]
@@ -739,13 +629,16 @@ fn setup_dust(
         cull_mode: None,
         ..default()
     });
-    let c = claim_center();
     for i in 0..DUST_MOTES as u64 {
         let h = |salt: u64| hash1(i.wrapping_mul(40503) ^ salt);
         commands.spawn((
             Mesh3d(mesh.clone()),
             MeshMaterial3d(mat.clone()),
-            Transform::from_translation(c + Vec3::new(h(1) * 8.0 - 4.0, h(2) * 8.0 - 4.0, h(3) * 8.0 - 4.0)),
+            Transform::from_translation(Vec3::new(
+                h(1) * 8.0 - 4.0,
+                h(2) * 8.0 - 4.0,
+                h(3) * 8.0 - 4.0,
+            )),
             Visibility::Hidden,
             DustMote {
                 vel: Vec3::new(h(4) - 0.5, h(5) - 0.6, h(6) - 0.5) * 0.16,
@@ -754,15 +647,16 @@ fn setup_dust(
     }
 }
 
-/// Drift around the player, wrapping inside a 8m box; only visible once
-/// you're properly underground where the headlamp catches them.
+/// Drift around the player, wrapping inside a 8m box; only visible when
+/// you're buried enough that the headlamp is doing the lighting.
 fn dust_drift(
     time: Res<Time>,
     player: Res<PlayerState>,
+    enclosure: Res<Enclosure>,
     mut motes: Query<(&DustMote, &mut Transform, &mut Visibility)>,
 ) {
     let dt = time.delta_secs();
-    let show = player.depth_m() > 3.0;
+    let show = enclosure.0 > 0.35;
     let center = player.eye();
     for (mote, mut tf, mut vis) in &mut motes {
         *vis = if show {

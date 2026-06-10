@@ -13,7 +13,7 @@ mod player;
 mod sky;
 mod world;
 
-use player::PlayerState;
+use player::Enclosure;
 
 /// Systems that read player input and mutate gameplay state. The demo driver
 /// runs before this set so injected input is seen the same frame.
@@ -21,10 +21,13 @@ use player::PlayerState;
 pub struct GameplaySet;
 
 /// Hard vacuum: the sun switches off fast once rock swallows the sky.
-const DAYLIGHT_FADE_M: f32 = 6.0;
 const SUN_LUX: f32 = 8_000.0;
-const AMBIENT_SURFACE: f32 = 60.0;
-/// Ambient floor underground so unlit faces aren't pure black.
+/// Cool fill from the anti-sun side — physically it's starlight/planetshine,
+/// practically it keeps shadow-side voxel faces from being void-black stripes
+/// against space.
+const FILL_LUX: f32 = 1_000.0;
+const AMBIENT_SURFACE: f32 = 130.0;
+/// Ambient floor in tunnels so unlit faces aren't pure black.
 const AMBIENT_CAVE: f32 = 7.0;
 
 fn main() {
@@ -65,39 +68,52 @@ fn main() {
         .run();
 }
 
+/// Marks a sky light; the wrapped value is its full-daylight illuminance.
 #[derive(Component)]
-struct Sun;
+struct Sun(f32);
 
 fn setup_lights(mut commands: Commands) {
     commands.spawn((
         DirectionalLight {
             illuminance: SUN_LUX,
-            // No shadow maps: depth-based darkening below carries the "deep
-            // underground" read, and skipping shadows avoids cascade tuning
-            // for a shaft hundreds of meters tall.
+            // No shadow maps: the Enclosure probe carries the "inside rock"
+            // read, and skipping shadows avoids cascade tuning over an
+            // effectively unbounded world.
             shadows_enabled: false,
             ..default()
         },
-        // Shine from the sun's sky position toward the claim.
+        // Shine from the sun's sky position toward the origin.
         Transform::default().looking_to(-sky::sun_direction(), Vec3::Y),
-        Sun,
+        Sun(SUN_LUX),
+    ));
+    // Anti-sun fill, tilted so the two lights never zero out the same face.
+    let fill_from = (-sky::sun_direction() + Vec3::new(0.2, 0.55, -0.25)).normalize();
+    commands.spawn((
+        DirectionalLight {
+            illuminance: FILL_LUX,
+            color: Color::srgb(0.55, 0.65, 1.0),
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::default().looking_to(-fill_from, Vec3::Y),
+        Sun(FILL_LUX),
     ));
 }
 
-/// Fade sun and ambient toward darkness as the player descends. The helmet
-/// lamp (child of the camera) becomes the dominant light underground; the
-/// skybox stays — looking up a deep shaft shows stars, as it should.
+/// Fade sun and ambient as the player tunnels into rock (no shadow maps —
+/// the Enclosure probe fakes occlusion). The helmet lamp becomes the
+/// dominant light inside; the skybox stays, so a shaft mouth shows stars.
 fn depth_lighting(
-    player: Res<PlayerState>,
+    enclosure: Res<Enclosure>,
     mut ambients: Query<&mut AmbientLight>,
-    mut suns: Query<&mut DirectionalLight, With<Sun>>,
+    mut suns: Query<(&Sun, &mut DirectionalLight)>,
 ) {
-    let daylight = (1.0 - player.depth_m() / DAYLIGHT_FADE_M).clamp(0.0, 1.0);
+    let daylight = 1.0 - enclosure.0;
     for mut ambient in &mut ambients {
         ambient.brightness = AMBIENT_CAVE + (AMBIENT_SURFACE - AMBIENT_CAVE) * daylight;
     }
-    if let Ok(mut sun) = suns.single_mut() {
-        sun.illuminance = SUN_LUX * daylight;
+    for (sun, mut light) in &mut suns {
+        light.illuminance = sun.0 * daylight;
     }
 }
 

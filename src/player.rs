@@ -1,6 +1,6 @@
-//! First-person player: mouse look, WASD movement with voxel AABB collision
-//! under asteroid gravity, a jetpack, and the mining laser (hold LMB —
-//! continuous damage-per-second vs block HP, with a heat/overheat loop).
+//! First-person player: mouse look, zero-G 6DOF thruster flight with voxel
+//! AABB collision, surface walking on asteroid tops, and the mining laser
+//! (hold LMB — continuous damage-per-second vs block HP, with a heat loop).
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
@@ -10,8 +10,8 @@ use crate::audio::{SfxEvent, SfxQueue};
 use crate::game::Upgrades;
 use crate::items::{self, ItemAssets};
 use crate::world::{
-    self, block_display_name, block_hp, band_of_depth, depth_of, raycast, VoxelWorld, AIR,
-    BARRIER, ORE, REGOLITH, VOXEL, WORLD_VOXELS_XZ,
+    self, block_display_name, block_hp, raycast, tier_of_voxel, VoxelWorld, AIR, BARRIER, ORE,
+    REGOLITH, VOXEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -22,17 +22,19 @@ use crate::world::{
 const PLAYER_HALF: Vec3 = Vec3::new(0.30, 0.70, 0.30);
 /// Eye height above the feet.
 const EYE: f32 = 1.25;
-/// Asteroid gravity. Earth-weight miners need not apply.
-const GRAVITY: f32 = -7.5;
-/// Falling faster than this risks crossing a whole voxel in one substep.
-const TERMINAL_FALL: f32 = 16.0;
-/// Jump impulse: apex ≈ 1.4m under low gravity — an easy 5-voxel hop.
-const JUMP_VEL: f32 = 4.6;
-/// Jetpack: hold Space while airborne. Weak but tireless — it will lift you
-/// out of any shaft eventually, the recall rig just does it instantly.
-const JET_ACCEL: f32 = 14.0;
-const JET_MAX_CLIMB: f32 = 3.2;
+/// Suit thrusters: zero-G 6DOF flight. W/S along the look ray, A/D strafe,
+/// Space up, C down, Shift brakes hard. Idle drift bleeds off slowly so
+/// space feels floaty but the ship... er, miner, stays controllable.
+const THRUST: f32 = 16.0;
+const MAX_SPEED: f32 = 18.0;
+const IDLE_DAMP: f32 = 1.1;
+const BRAKE_DAMP: f32 = 6.0;
+/// Walking on a surface uses direct velocity for precise mining footwork.
 const WALK_SPEED: f32 = 4.5;
+/// Hop impulse when grounded (Space tap); hold to keep thrusting up.
+const JUMP_VEL: f32 = 4.0;
+/// Don't cross more than ~half a voxel per collision substep.
+const MAX_STEP_SPEED: f32 = 28.0;
 const MOUSE_SENS: f32 = 0.0023;
 /// Mining reach in world units (~17 voxels).
 const REACH: f32 = 4.2;
@@ -59,15 +61,14 @@ pub struct PlayerState {
     pub yaw: f32,
     pub pitch: f32,
     pub grounded: bool,
-    /// Deepest depth reached (m) and where we were standing when we reached it.
-    pub max_depth: f32,
-    pub deepest_pos: Vec3,
+    /// Farthest range from home reached (m), and where that was.
+    pub max_range: f32,
+    pub far_pos: Vec3,
 }
 
 impl PlayerState {
     pub fn spawn_point() -> Vec3 {
-        let c = WORLD_VOXELS_XZ as f32 * VOXEL * 0.5;
-        Vec3::new(c, 0.0, c)
+        world::home_spawn()
     }
 
     pub fn eye(&self) -> Vec3 {
@@ -82,8 +83,10 @@ impl PlayerState {
         self.look_rot() * Vec3::NEG_Z
     }
 
-    pub fn depth_m(&self) -> f32 {
-        (-self.pos.y).max(0.0)
+    /// Distance out from the home rock's surface — the progression axis.
+    /// (Standing at the depot reads 0, not the rock's radius.)
+    pub fn range_m(&self) -> f32 {
+        (self.pos.length() - world::HOME_R).max(0.0)
     }
 }
 
@@ -95,11 +98,17 @@ impl Default for PlayerState {
             yaw: 0.0,
             pitch: -0.2,
             grounded: false,
-            max_depth: 0.0,
-            deepest_pos: Self::spawn_point(),
+            max_range: 0.0,
+            far_pos: Self::spawn_point(),
         }
     }
 }
+
+/// How buried the player is, 0 (open sky) to 1 (rock overhead). Drives the
+/// sun/ambient fade and the dust motes. Probed with an upward ray and
+/// smoothed so light doesn't pop when crossing a tunnel mouth.
+#[derive(Resource, Default)]
+pub struct Enclosure(pub f32);
 
 /// True while the cursor is grabbed and gameplay input is live.
 #[derive(Resource, Default)]
@@ -162,6 +171,14 @@ enum LaserFx {
 #[derive(Component)]
 struct ImpactLightMark;
 
+/// Helmet lamp parts — intensity follows Enclosure (sun does the work
+/// outside; the lamp takes over in tunnels, instead of stacking on daylight).
+#[derive(Component)]
+struct HeadLamp {
+    max: f32,
+    min: f32,
+}
+
 /// Root of the first-person tool model (child of the camera).
 #[derive(Component)]
 struct ViewmodelRoot;
@@ -185,6 +202,7 @@ impl Plugin for PlayerPlugin {
             .init_resource::<LaserState>()
             .init_resource::<JetState>()
             .init_resource::<Shake>()
+            .init_resource::<Enclosure>()
             .add_systems(Startup, setup_player)
             .add_systems(
                 Update,
@@ -192,6 +210,8 @@ impl Plugin for PlayerPlugin {
                     grab_cursor,
                     mouse_look,
                     player_move,
+                    update_enclosure,
+                    headlamp_adapt,
                     mining,
                     sync_camera,
                     laser_fx,
@@ -241,8 +261,8 @@ fn setup_player(
             // Per-camera ambient light (0.18: AmbientLight is a component, not
             // a resource). depth_lighting in main.rs retunes it every frame.
             AmbientLight {
-                color: Color::srgb(0.75, 0.82, 1.0),
-                brightness: 60.0,
+                color: Color::srgb(0.85, 0.90, 1.0),
+                brightness: 130.0,
                 ..default()
             },
             PlayerCamera,
@@ -250,11 +270,12 @@ fn setup_player(
         .with_children(|parent| {
             // Helmet lamp: a tight spot doing the "headlamp cone" read. A spot
             // concentrates its lumens ~10x vs a point light — keep it modest
-            // or every close-up wall is a white disc.
+            // or every close-up wall is a white disc. Intensity is driven by
+            // the Enclosure probe each frame (headlamp_adapt).
             parent.spawn((
                 SpotLight {
                     color: Color::srgb(0.95, 0.98, 1.0),
-                    intensity: 400_000.0,
+                    intensity: 60_000.0,
                     range: 34.0,
                     inner_angle: 0.30,
                     outer_angle: 0.62,
@@ -262,17 +283,25 @@ fn setup_player(
                     ..default()
                 },
                 Transform::IDENTITY,
+                HeadLamp {
+                    max: 480_000.0,
+                    min: 40_000.0,
+                },
             ));
             // ...plus a faint fill so the tunnel right at your feet isn't void.
             parent.spawn((
                 PointLight {
                     color: Color::srgb(0.8, 0.88, 1.0),
-                    intensity: 40_000.0,
+                    intensity: 8_000.0,
                     range: 6.0,
                     shadows_enabled: false,
                     ..default()
                 },
                 Transform::IDENTITY,
+                HeadLamp {
+                    max: 40_000.0,
+                    min: 6_000.0,
+                },
             ));
 
             // First-person mining laser, built from primitives. All children
@@ -430,10 +459,21 @@ fn player_move(
     mut commands: Commands,
 ) {
     let dt = time.delta_secs().min(0.05); // clamp tunneling on hitches
+
+    // Thrust wish vector. Grounded: flat walk axes for precise footwork.
+    // Airborne: full 6DOF — W follows the look ray (pitch included).
     let mut wish = Vec3::ZERO;
+    let mut vertical = 0.0f32;
     if focused.0 {
-        let fwd = Quat::from_rotation_y(player.yaw) * Vec3::NEG_Z;
-        let right = Quat::from_rotation_y(player.yaw) * Vec3::X;
+        let (fwd, right) = if player.grounded {
+            let f = Quat::from_rotation_y(player.yaw) * Vec3::NEG_Z;
+            let r = Quat::from_rotation_y(player.yaw) * Vec3::X;
+            (f, r)
+        } else {
+            let f = player.look_dir();
+            let r = Quat::from_rotation_y(player.yaw) * Vec3::X;
+            (f, r)
+        };
         if keys.pressed(KeyCode::KeyW) {
             wish += fwd;
         }
@@ -446,30 +486,54 @@ fn player_move(
         if keys.pressed(KeyCode::KeyA) {
             wish -= right;
         }
-    }
-    let wish = wish.normalize_or_zero() * WALK_SPEED;
-    player.vel.x = wish.x;
-    player.vel.z = wish.z;
-    player.vel.y += GRAVITY * dt;
-
-    jet.0 = false;
-    if focused.0 && keys.pressed(KeyCode::Space) {
-        if player.grounded {
-            player.vel.y = JUMP_VEL;
-        } else {
-            // Jetpack: gentle climb, the asteroid barely fights back.
-            player.vel.y = (player.vel.y + JET_ACCEL * dt).min(JET_MAX_CLIMB);
-            jet.0 = true;
+        if keys.pressed(KeyCode::Space) {
+            vertical += 1.0;
+        }
+        if keys.pressed(KeyCode::KeyC) {
+            vertical -= 1.0;
         }
     }
+    let wish = wish.normalize_or_zero();
+    let thrusting = wish != Vec3::ZERO || vertical != 0.0;
+    let braking = focused.0 && keys.pressed(KeyCode::ShiftLeft);
 
-    player.vel.y = player.vel.y.max(-TERMINAL_FALL);
+    if player.grounded {
+        // Planted: direct velocity control. No stick force — with vertical
+        // velocity exactly zero, the 1mm ground probe keeps `grounded` set;
+        // any constant downward push would leave us micro-hovering above the
+        // snap plane and flicker the flag at high FPS.
+        let walk = wish * WALK_SPEED;
+        player.vel.x = walk.x;
+        player.vel.z = walk.z;
+        player.vel.y = if vertical > 0.0 { JUMP_VEL } else { 0.0 };
+        jet.0 = false;
+    } else {
+        // Free flight: accelerate, brake, or drift.
+        let accel = (wish + Vec3::Y * vertical).normalize_or_zero() * THRUST;
+        player.vel += accel * dt;
+        let damp = if braking { BRAKE_DAMP } else { IDLE_DAMP };
+        if !thrusting || braking {
+            let v = player.vel;
+            player.vel = v * (-damp * dt).exp();
+        }
+        let speed = player.vel.length();
+        if speed > MAX_SPEED {
+            let v = player.vel;
+            player.vel = v * (MAX_SPEED / speed);
+        }
+        jet.0 = thrusting;
+    }
+    let speed = player.vel.length();
+    if speed > MAX_STEP_SPEED {
+        let v = player.vel;
+        player.vel = v * (MAX_STEP_SPEED / speed);
+    }
 
     // Per-axis swept move, substepped so no axis crosses more than ~half a
-    // voxel per step — otherwise a long fall can tunnel through a floor and
-    // the boundary snap embeds the player inside solid ground.
+    // voxel per step — otherwise a fast pass can tunnel through a wall and
+    // the boundary snap embeds the player inside solid rock.
     let was_grounded = player.grounded;
-    let fall_speed = -player.vel.y;
+    let impact_speed = player.vel.length();
     let mut pos = player.pos;
     let mut vel = player.vel;
     let max_disp = (vel * dt).abs().max_element();
@@ -485,24 +549,55 @@ fn player_move(
     player.pos = pos;
     player.vel = vel;
 
-    // Landing feel: thud + dust + a touch of shake, scaled by impact.
-    if grounded && !was_grounded && fall_speed > 4.0 {
-        let k = ((fall_speed - 4.0) / 10.0).clamp(0.0, 1.0);
-        shake.add(0.08 + 0.12 * k);
+    // Touchdown feel: thud + dust + a touch of shake, scaled by impact.
+    if grounded && !was_grounded && impact_speed > 3.0 {
+        let k = ((impact_speed - 3.0) / 10.0).clamp(0.0, 1.0);
+        shake.add(0.06 + 0.12 * k);
         sfx.push(SfxEvent::Land);
         if let Some(assets) = &assets {
             items::spawn_land_dust(&mut commands, assets, player.pos);
         }
     }
 
-    // Track deepest standable point for the [G] return teleport.
-    if player.grounded {
-        let depth = player.depth_m();
-        if depth > player.max_depth + 0.01 {
-            player.max_depth = depth;
-            player.deepest_pos = player.pos;
+    // Track the farthest site for the [G] long-jump teleport.
+    let range = player.range_m();
+    if range > player.max_range + 0.5 {
+        player.max_range = range;
+        player.far_pos = player.pos;
+    }
+}
+
+/// Brighten the helmet lamp as the sky disappears.
+fn headlamp_adapt(
+    enclosure: Res<Enclosure>,
+    mut spots: Query<(&HeadLamp, Option<&mut SpotLight>, Option<&mut PointLight>)>,
+) {
+    for (lamp, spot, point) in &mut spots {
+        let i = lamp.min + (lamp.max - lamp.min) * enclosure.0;
+        if let Some(mut s) = spot {
+            s.intensity = i;
+        }
+        if let Some(mut p) = point {
+            p.intensity = i;
         }
     }
+}
+
+/// Probe how buried we are: an upward ray that hits rock soon means we're in
+/// a tunnel and the sun shouldn't reach us. Smoothed to avoid light pops.
+fn update_enclosure(
+    time: Res<Time>,
+    world: Res<VoxelWorld>,
+    player: Res<PlayerState>,
+    mut enclosure: ResMut<Enclosure>,
+) {
+    const PROBE_M: f32 = 12.0;
+    let target = match raycast(&world, player.eye(), Vec3::Y, PROBE_M) {
+        Some(hit) => (1.0 - hit.t / PROBE_M).clamp(0.0, 1.0).powf(0.5),
+        None => 0.0,
+    };
+    let k = (time.delta_secs() * 4.0).min(1.0);
+    enclosure.0 += (target - enclosure.0) * k;
 }
 
 /// Move along one axis and clamp against solid voxels. Returns true if we hit
@@ -668,11 +763,10 @@ fn mining(
     laser.has_hit = true;
     laser.beam_end = eye + dir * (hit.t - 0.01).max(0.1);
 
-    let depth = depth_of(v);
-    let band = band_of_depth(depth);
-    let hp_max = block_hp(id, depth);
+    let tier = tier_of_voxel(v);
+    let hp_max = block_hp(id, tier);
     let is_ore = id == ORE;
-    let value = if is_ore { world::ore_value(band) } else { 0 };
+    let value = if is_ore { world::ore_value(tier) } else { 0 };
 
     let mut remaining = *world.damage.get(&v).unwrap_or(&hp_max);
     if laser.firing && id != BARRIER {
@@ -714,7 +808,7 @@ fn mining(
                 pitch: if id == REGOLITH {
                     1.15
                 } else {
-                    (1.0 - band as f32 * 0.05).max(0.7)
+                    (1.0 - tier as f32 * 0.05).max(0.7)
                 },
             });
             shake.add(0.05);
@@ -740,7 +834,7 @@ fn mining(
     }
 
     target.0 = Some(TargetBlock {
-        name: block_display_name(id, depth),
+        name: block_display_name(id, tier),
         hp_frac: if hp_max.is_finite() {
             (remaining / hp_max).clamp(0.0, 1.0)
         } else {

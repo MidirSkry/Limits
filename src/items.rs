@@ -12,16 +12,15 @@ use std::collections::HashMap;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::game::{Inventory, StatusMsg, Upgrades};
 use crate::player::{PlayerState, Shake};
-use crate::world::{
-    band_of_depth, depth_of, loot_color, VoxelWorld, AIR, BARRIER, VOXEL,
-};
+use crate::world::{loot_color, tier_of_voxel, VoxelWorld, AIR, BARRIER, VOXEL};
 
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
 
-/// Asteroid gravity — items fall lazily, like everything else here.
-const GRAVITY: f32 = -7.5;
+/// Zero-G: loose items drift, they don't fall. Damping settles a blast's
+/// debris cloud into slow tumble instead of letting it disperse forever.
+const DRIFT_DAMP: f32 = 0.55;
 const DROP_SIZE: f32 = 0.1;
 /// Drops vanish after this long so an unlooted crater doesn't leak entities.
 const DROP_TTL: f32 = 90.0;
@@ -231,11 +230,13 @@ pub fn spawn_drop(
     v: IVec3,
     id: u8,
 ) {
-    let band = band_of_depth(depth_of(v));
+    let tier = tier_of_voxel(v);
     let center = (v.as_vec3() + Vec3::splat(0.5)) * VOXEL;
     let a = scatter(v, 1) * std::f32::consts::TAU;
-    let vel = Vec3::new(a.cos() * 0.8, 1.2 + scatter(v, 2), a.sin() * 0.8);
-    spawn_drop_at(commands, assets, materials, center, id, band, 1, vel);
+    // Gentle pop: in zero-G a fast drop coasts straight out of tractor range
+    // and is simply gone.
+    let vel = Vec3::new(a.cos() * 0.3, 0.25 + scatter(v, 2) * 0.3, a.sin() * 0.3);
+    spawn_drop_at(commands, assets, materials, center, id, tier, 1, vel);
 }
 
 pub fn spawn_block_debris(commands: &mut Commands, assets: &ItemAssets, v: IVec3) {
@@ -326,7 +327,9 @@ fn drop_physics(
             commands.entity(entity).despawn();
             continue;
         }
-        drop.vel.y += GRAVITY * dt;
+        // Zero-G drift with damping, so loot hangs near where it popped.
+        let v = drop.vel;
+        drop.vel = v * (-DRIFT_DAMP * 1.8 * dt).exp();
         // Per-axis point collision: stop the axis instead of entering a wall.
         let mut p = tf.translation;
         for axis in 0..3 {
@@ -464,8 +467,7 @@ fn charge_tick(
             );
             continue;
         }
-        // Ballistic fall with the same per-axis stop the drops use.
-        charge.vel.y += GRAVITY * dt;
+        // Plasma torpedo: sails straight in zero-G until it sticks.
         let mut p = tf.translation;
         for axis in 0..3 {
             let mut np = p;
@@ -508,8 +510,11 @@ fn explode(
 ) {
     let r_vox = (PLASMA_RADIUS_M / VOXEL).ceil() as i32;
     let c_vox = (center / VOXEL).floor().as_ivec3();
+    // One blast = one asteroid (in practice): a single tier lookup covers
+    // every carved voxel instead of 12k field queries.
+    let blast_tier = tier_of_voxel(c_vox);
     let mut carved = 0usize;
-    // Loot aggregation: (id, band) -> voxels destroyed.
+    // Loot aggregation: (id, tier) -> voxels destroyed.
     let mut loot: HashMap<(u8, i32), u32> = HashMap::new();
     for dy in -r_vox..=r_vox {
         for dz in -r_vox..=r_vox {
@@ -524,7 +529,7 @@ fn explode(
                     continue;
                 }
                 world.set_air(v);
-                *loot.entry((id, band_of_depth(depth_of(v)))).or_insert(0) += 1;
+                *loot.entry((id, blast_tier)).or_insert(0) += 1;
                 carved += 1;
             }
         }
@@ -677,8 +682,10 @@ fn update_debris(
             commands.entity(entity).despawn();
             continue;
         }
-        let g = d.grav;
-        d.vel.y += GRAVITY * g * dt;
+        // Drift + damp; `grav` doubles as how quickly this debris settles.
+        let damp = DRIFT_DAMP * (0.5 + d.grav);
+        let v = d.vel;
+        d.vel = v * (-damp * dt).exp();
         tf.translation += d.vel * dt;
         tf.rotation *= Quat::from_rotation_x(6.0 * dt) * Quat::from_rotation_y(4.0 * dt);
         // Sparks shrink away instead of popping out.

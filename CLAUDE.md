@@ -1,24 +1,25 @@
 # [Limits]
 
-A Bevy 0.18 incremental space-mining game: first-person **laser mining on a very large asteroid** (0.25m voxels — the player is ~6 voxels tall). Carve down as far as possible; each 64-layer (16m) band doubles block HP and raises crystal value, loot tractors into your hold, you sell at the surface depot and buy laser/coolant/tractor/recall upgrades to push deeper. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
+A Bevy 0.18 incremental space-mining game: first-person **zero-G laser mining in an open asteroid field** (0.25m voxels — the player is ~6 voxels tall). Fly out from the home rock, carve into procedural asteroids, tractor the loot, sell at the home depot, and buy laser/coolant/tractor/recall upgrades to push further out — each 120m "sector" tier doubles rock HP and raises crystal value. Grown out of (and still benchmarked like) a high-entity-count stress sandbox.
 
 ## Game loop & controls
 
-- Click to grab the cursor. WASD + mouse-look; **Space** jumps, and held while airborne fires the **jetpack** (weak but tireless — asteroid gravity is 7.5 m/s²).
+- Click to grab the cursor. Mouse-look + **6DOF thruster flight**: W/S along the look ray, A/D strafe, **Space** up, **C** down, **Shift** brakes. On an asteroid surface you walk (flat WASD) and Space hops you off. Zero-G: nothing falls, including you.
 - Hold **LMB** to fire the mining laser: continuous DPS vs block HP. The beam builds **heat**; at 100% it locks and vents for ~2s (red emitter, warning text). Coolant upgrades stretch fire time.
-- Every destroyed voxel drops physical loot that tractor-beams to you in range; crystals glow in the walls (band 0 "Carbon" is deliberately modest — colors get loud deeper).
-- **Q** throws a plasma charge: 2s fuse, carves a 4m sphere, loot arrives as *stacked* drops. You start with 2; more are 60 cr at the depot.
-- **E** at the depot pad sells the hold; **1/2/3/4/5** buy laser power / coolant loop / tractor field / recall rig / plasma charges. **T** recalls to the surface, **G** dives back to best depth (after buying recall).
-- Hits pop floating damage numbers (gold + larger on a killing blow); sells pop credit text at the pad. HUD is styled panels: stats top-left, reticle + heat bar + target HP bar at center, depot panel by the pad, status toast at the bottom.
+- Every destroyed voxel drops physical loot that tractor-beams to you in range; crystals glow in the walls (tier 0 "Carbon" is deliberately modest — colors get loud further out). Asteroids are richer toward their centers and have a pure-crystal core.
+- **Q** throws a plasma charge: 2s fuse, carves a 4m sphere, loot arrives as *stacked* drops. You start with 2; more at the depot.
+- **E** at the depot pad sells the hold; **1/2/3/4/5** buy laser power / coolant loop / tractor field / recall rig / plasma charges. **T** recalls home, **G** jumps back to your farthest-reached site (after buying recall).
+- HUD: top status bar (credits · range/best/sector · speed), reticle + heat bar + charge pips, target HP panel, per-row depot panel with affordability colors, status toast, hold summary, and a **⌂ nav marker** that pins the depot to the screen edge when it's off-camera.
 - The whole progression curve (HP/value/cost growth factors) lives in the constants at the top of `src/game.rs` and `src/world.rs`.
 
 ## Architecture notes
 
-- World: fixed 96x96-voxel (24m) claim, chunked 16³, generated lazily downward; worldgen is a pure function of voxel coords (`world::block_at`), so chunks store one byte per voxel and partial mining damage is a sparse map.
-- Perf probe for cube-size decisions: `cargo test bench_remesh -- --ignored --nocapture` prints worldgen/mesh/explosion-remesh timings headlessly.
+- World: an unbounded 3D asteroid field, chunked 16³ in all directions. A deterministic hash gives each 56m cell at most one asteroid (lumpy fbm-displaced sphere, regolith shell, ore odds rising toward a crystal core); the home rock sits at the origin. Worldgen is a pure function of voxel coords (`world::block_at`); chunks store one byte per voxel.
+- Chunk streaming: chunks materialize nearest-first within ~56m of the player (budgeted per frame) and unload behind them. Pure-vacuum chunks cost a set entry, never storage/entities. **Player edits live in a sparse overlay** that survives unload and is re-applied on regeneration (this is also exactly what a save file would serialize). `VoxelWorld::block()` falls back to pure worldgen + edits for unmaterialized chunks, so collision/raycasts are correct anywhere. A test asserts chunk contents always equal pure gen.
+- Lighting: no shadow maps. An upward-ray **Enclosure** probe (smoothed) fades sun + ambient when you're inside rock, and drives the helmet lamp the *opposite* way (dim in daylight, bright in tunnels — they never stack). A weak cool anti-sun fill keeps shadow-side voxel faces from being void-black stripes against space.
 - Rendering: **two** naive-culled meshes per chunk, vertex-colored (no block textures): a lit mesh for rock, and an unlit mesh whose vertex colors run >1.0 for crystal faces — the HDR camera + bloom turn those into glowing ore veins. Remeshed on demand with a per-frame budget.
 - The camera carries `Hdr` + `Bloom` + `Tonemapping::TonyMcMapface` (inserted by `sky.rs` in PostStartup). Every glow in the game — laser beam, crystals, sun, depot beacon, sparks — is just an unlit material with linear color >1.0 feeding that bloom pass. Keep light intensities modest: a spotlight concentrates lumens ~10x vs a point light and will white-disc any close wall.
-- Sky (`sky.rs`): a starfield **cubemap** (milky way, nebulae, hashed stars) generated into an `Image` at startup + HDR sun ball, ringed gas giant (procedural equirect texture), moon, twinkling foreground stars, shooting stars, a cratered heightfield horizon for the host asteroid, and headlamp dust motes underground. Zero texture/model assets in the repo.
+- Sky (`sky.rs`): a starfield **cubemap** (milky way, nebulae, hashed stars) generated into an `Image` at startup + HDR sun ball, ringed gas giant (procedural equirect texture), moon, twinkling stars, and shooting stars — all parented to a `SkyAnchor` that follows the player, so they sit at effective infinity in the open world. Headlamp dust motes appear in tunnels. Zero texture/model assets in the repo.
 - Audio (`audio.rs`): every clip synthesized at startup into in-memory WAVs (`AudioSource { bytes }` — needs the `wav` cargo feature). Gameplay pushes `SfxEvent`s into the `SfxQueue` resource; loops (laser hum, jetpack, ambient drone) follow the `LaserState`/`JetState` resources. No audio files.
 - Explosions aggregate loot into **stacked drops** (`count` per drop entity, ≤14 stacks per material group) — never one drop per voxel; a 4m blast carves ~12k voxels and one-entity-per-voxel was 553k entities / 9 FPS in playtesting.
 
@@ -85,15 +86,17 @@ Don't build these yet; note them so we don't forget.
 
 ```
 src/
-  main.rs    App wiring, GameplaySet, sun + depth lighting fade, bench-exit hook
-  world.rs   Voxel storage/worldgen/dual meshing (lit + glow)/raycast, chunks (WorldPlugin)
-  player.rs  FPS controller + jetpack, voxel AABB collision, laser mining + heat,
-             beam/impact FX, viewmodel sway, screen shake (PlayerPlugin)
+  main.rs    App wiring, GameplaySet, sun + fill + enclosure lighting, bench-exit hook
+  world.rs   Asteroid-field worldgen, chunk streaming + edit overlay, dual meshing
+             (lit + glow), raycast (WorldPlugin)
+  player.rs  6DOF zero-G flight + surface walking, voxel AABB collision, laser
+             mining + heat, Enclosure probe, beam/impact FX, viewmodel, shake (PlayerPlugin)
   items.rs   Stacked loot drops + tractor pickup, plasma charges, explosions
              (flash/shockwave/sparks/debris) (ItemsPlugin)
   game.rs    Credits/hold/upgrades/depot/teleports — the incremental economy (GamePlugin)
-  hud.rs     Stats, reticle + heat bar + target HP bar, depot panel, float text (HudPlugin)
-  sky.rs     Starfield cubemap, HDR camera setup, sun/planet/moon/stars/horizon (SkyPlugin)
+  hud.rs     Top bar, reticle + heat + pips, target panel, depot rows, nav marker,
+             float text (HudPlugin)
+  sky.rs     Starfield cubemap, HDR camera setup, SkyAnchor celestials, dust (SkyPlugin)
   audio.rs   Procedural WAV synthesis, SfxQueue, laser/jet/ambient loops (SoundPlugin)
   demo.rs    LIMITS_DEMO scripted tour + screenshots — hands-off verification (DemoPlugin)
 .cargo/
@@ -104,10 +107,10 @@ rust-toolchain.toml  Pins GNU ABI on this machine; see "Toolchain" above
 ## Bench & verification hooks
 
 - `LIMITS_BENCH_EXIT_AFTER=<seconds>` — process exits after that elapsed wall time.
-- `LIMITS_DEMO=1` — scripted ~28s tour (sky pan → laser → overheat → plasma crater → crater pan → jetpack → depot sell) that saves 8 PNGs into `shots/` and logs `[demo]` position breadcrumbs to stderr. Combine both for a self-terminating visual smoke test:
+- `LIMITS_DEMO=1` — scripted ~25s tour (sky pan → laser to overheat → fly to the nearest neighbor asteroid → torpedo it → fly home → sell) that saves 8 PNGs into `shots/` and logs `[demo]` breadcrumbs to stderr. Combine both for a self-terminating visual smoke test:
 
 ```sh
-LIMITS_DEMO=1 LIMITS_BENCH_EXIT_AFTER=29 ./target/release/limits.exe > demo.log 2>&1
+LIMITS_DEMO=1 LIMITS_BENCH_EXIT_AFTER=30 ./target/release/limits.exe > demo.log 2>&1
 ```
 
 `LogDiagnosticsPlugin` writes FPS / frame_time / entity_count to stdout once per second, so:

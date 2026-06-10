@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::player::PlayerState;
-use crate::world::{loot_value, VOXEL, WORLD_VOXELS_XZ};
+use crate::world::loot_value;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Tunables — the entire progression curve lives in these constants.
@@ -22,7 +23,7 @@ const HEAT_RATE_SHRINK: f32 = 0.85;
 const BASE_COOL_RATE: f32 = 0.45;
 const COOL_RATE_GROWTH: f32 = 1.12;
 /// Tractor field: how far drops magnet toward the player.
-const BASE_MAGNET_RANGE: f32 = 1.8;
+const BASE_MAGNET_RANGE: f32 = 2.4;
 const MAGNET_RANGE_STEP: f32 = 0.8;
 
 const POWER_COST: f64 = 12.0;
@@ -150,9 +151,12 @@ impl StatusMsg {
 #[derive(Resource, Default)]
 pub struct NearShop(pub bool);
 
+/// The depot pad sits on the home rock's surface a short walk from spawn.
+/// Cached: the surface scan runs worldgen noise and callers hit this per
+/// frame.
 pub fn shop_pos() -> Vec3 {
-    let c = WORLD_VOXELS_XZ as f32 * VOXEL * 0.5;
-    Vec3::new(c + 3.0, 0.0, c)
+    static POS: OnceLock<Vec3> = OnceLock::new();
+    *POS.get_or_init(|| Vec3::new(4.5, crate::world::surface_y_at(4.5, 0.0), 0.0))
 }
 
 // ---------------------------------------------------------------------------
@@ -209,14 +213,14 @@ fn setup_shop(
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(0.22))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::linear_rgb(2.5, 5.0, 6.0),
+            base_color: Color::linear_rgb(1.0, 2.0, 2.4),
             unlit: true,
             ..default()
         })),
-        Transform::from_translation(pos + Vec3::Y * 1.1),
+        Transform::from_translation(pos + Vec3::Y * 2.4),
         HoloSpin {
             rate: 0.0,
-            base_y: 1.1,
+            base_y: 2.4,
         },
     ));
     // ...two slow counter-rotating holo rings...
@@ -230,7 +234,7 @@ fn setup_shop(
     let ring = meshes.add(crate::sky::ring_mesh(0.42, 0.55, 48, |_| {
         [1.0, 1.0, 1.0, 1.0]
     }));
-    for (rate, y) in [(0.9f32, 1.1f32), (-0.6, 1.35)] {
+    for (rate, y) in [(0.9f32, 2.4f32), (-0.6, 2.65)] {
         commands.spawn((
             Mesh3d(ring.clone()),
             MeshMaterial3d(ring_mat.clone()),
@@ -390,13 +394,13 @@ fn teleport_system(
     if keys.just_pressed(KeyCode::KeyT) {
         player.pos = PlayerState::spawn_point();
         player.vel = Vec3::ZERO;
-        status.set("Recalled to the surface");
+        status.set("Recalled to the home rock");
         sfx.push(SfxEvent::WarpUp);
     }
-    if keys.just_pressed(KeyCode::KeyG) && player.max_depth > 1.0 {
-        player.pos = player.deepest_pos;
+    if keys.just_pressed(KeyCode::KeyG) && player.max_range > 25.0 {
+        player.pos = player.far_pos;
         player.vel = Vec3::ZERO;
-        status.set(format!("Dove back to {:.1}m", player.max_depth));
+        status.set(format!("Jumped to furthest site — {:.0}m out", player.max_range));
         sfx.push(SfxEvent::WarpDown);
     }
 }
