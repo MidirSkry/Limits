@@ -5,7 +5,7 @@ use bevy::prelude::*;
 
 use crate::game::{Inventory, NearShop, StatusMsg, Upgrades, Wallet, RECALL_COST};
 use crate::player::{Focused, PlayerState, TargetInfo};
-use crate::world::ore_name;
+use crate::world::loot_name;
 
 #[derive(Component)]
 struct StatsText;
@@ -126,12 +126,12 @@ fn hud_stats(
         spd = upgrades.swings_per_sec(),
     );
     // Show the most valuable few stacks so the pack readout stays compact.
-    for (&band, &count) in inventory.stacks.iter().rev().take(4) {
-        s.push_str(&format!("  {} x{}\n", ore_name(band), count));
+    for (&(id, band), &count) in inventory.stacks.iter().rev().take(4) {
+        s.push_str(&format!("  {} x{}\n", loot_name(id, band), count));
     }
     s.push('\n');
     if focused.0 {
-        s.push_str("WASD move  Space jump  LMB mine  Esc release mouse");
+        s.push_str("WASD move  Space jump  LMB mine  Q drop TNT  Esc release mouse");
         if upgrades.recall {
             s.push_str("\n[T] surface   [G] dive to best depth");
         }

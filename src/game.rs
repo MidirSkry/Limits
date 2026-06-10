@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use std::collections::BTreeMap;
 
 use crate::player::PlayerState;
-use crate::world::{ore_value, VOXEL, WORLD_VOXELS_XZ};
+use crate::world::{loot_value, VOXEL, WORLD_VOXELS_XZ};
 
 // ---------------------------------------------------------------------------
 // Tunables — the entire progression curve lives in these constants.
@@ -68,22 +68,23 @@ impl Upgrades {
     }
 }
 
-/// Ore inventory, keyed by band (which fully determines name and unit value).
+/// Loot inventory, keyed by (block id, band) — which together determine the
+/// display name and unit value. Everything mined ends up here, dirt included.
 #[derive(Resource, Default)]
 pub struct Inventory {
-    pub stacks: BTreeMap<i32, u32>,
+    pub stacks: BTreeMap<(u8, i32), u32>,
     pub units: u32,
 }
 
 impl Inventory {
-    pub fn add(&mut self, band: i32) {
-        *self.stacks.entry(band).or_insert(0) += 1;
+    pub fn add(&mut self, id: u8, band: i32) {
+        *self.stacks.entry((id, band)).or_insert(0) += 1;
         self.units += 1;
     }
     pub fn total_value(&self) -> u64 {
         self.stacks
             .iter()
-            .map(|(&band, &count)| ore_value(band) * count as u64)
+            .map(|(&(id, band), &count)| loot_value(id, band) * count as u64)
             .sum()
     }
     pub fn clear(&mut self) {
@@ -183,7 +184,7 @@ fn shop_system(
         } else {
             wallet.money += value;
             inventory.clear();
-            status.set(format!("Sold {units} ore for ${value}"));
+            status.set(format!("Sold {units} items for ${value}"));
         }
     }
 

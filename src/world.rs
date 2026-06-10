@@ -146,6 +146,40 @@ pub fn block_display_name(id: u8, depth: i32) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Loot — every destroyed voxel drops something. Junk sells for $1 at band 0;
+// rock value doubles per band so deep spoil isn't pure trash; ore is the prize.
+// ---------------------------------------------------------------------------
+
+pub fn loot_value(id: u8, band: i32) -> u64 {
+    match id {
+        SOIL => 1,
+        ROCK => 1u64 << band.clamp(0, 40),
+        ORE => ore_value(band),
+        _ => 0,
+    }
+}
+
+pub fn loot_name(id: u8, band: i32) -> String {
+    match id {
+        SOIL => "Dirt".to_string(),
+        ROCK => rock_name(band),
+        ORE => ore_name(band),
+        _ => String::new(),
+    }
+}
+
+/// Base (un-jittered) loot color for drop-item materials.
+pub fn loot_color(id: u8, band: i32) -> [f32; 3] {
+    let b = band.max(0) as usize;
+    match id {
+        SOIL => [0.42, 0.30, 0.18],
+        ROCK => ROCK_COLORS[b % ROCK_COLORS.len()],
+        ORE => ORE_COLORS[b % ORE_COLORS.len()],
+        _ => [1.0, 0.0, 1.0],
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Worldgen — pure function of voxel coords, so chunks regenerate identically.
 // ---------------------------------------------------------------------------
 

@@ -5,7 +5,8 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
 
-use crate::game::{Inventory, StatusMsg, Upgrades};
+use crate::game::Upgrades;
+use crate::items::{self, ItemAssets};
 use crate::world::{
     self, block_display_name, block_hp, band_of_depth, depth_of, raycast, VoxelWorld, AIR,
     BARRIER, ORE, VOXEL, WORLD_VOXELS_XZ,
@@ -29,9 +30,6 @@ const WALK_SPEED: f32 = 4.5;
 const MOUSE_SENS: f32 = 0.0023;
 /// Mining reach in world units (14 voxels).
 const REACH: f32 = 3.5;
-/// Blocks break ~2x as often at 0.25m cubes, so fewer chips per block.
-const DEBRIS_PER_BLOCK: usize = 3;
-const DEBRIS_TTL: f32 = 0.7;
 
 // ---------------------------------------------------------------------------
 // State
@@ -103,18 +101,6 @@ pub struct TargetBlock {
 #[derive(Component)]
 struct PlayerCamera;
 
-#[derive(Component)]
-struct Debris {
-    vel: Vec3,
-    ttl: f32,
-}
-
-#[derive(Resource)]
-struct DebrisAssets {
-    mesh: Handle<Mesh>,
-    material: Handle<StandardMaterial>,
-}
-
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -130,16 +116,11 @@ impl Plugin for PlayerPlugin {
             .add_systems(
                 Update,
                 (grab_cursor, mouse_look, player_move, sync_camera, mining).chain(),
-            )
-            .add_systems(Update, update_debris);
+            );
     }
 }
 
-fn setup_player(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+fn setup_player(mut commands: Commands) {
     commands
         .spawn((
             Camera3d::default(),
@@ -171,15 +152,6 @@ fn setup_player(
                 Transform::IDENTITY,
             ));
         });
-
-    commands.insert_resource(DebrisAssets {
-        mesh: meshes.add(Cuboid::new(0.08, 0.08, 0.08)),
-        material: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.5, 0.45, 0.4),
-            perceptual_roughness: 1.0,
-            ..default()
-        }),
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -361,10 +333,9 @@ fn mining(
     upgrades: Res<Upgrades>,
     mut swing_accum: Local<f32>,
     mut world: ResMut<VoxelWorld>,
-    mut inventory: ResMut<Inventory>,
     mut target: ResMut<TargetInfo>,
-    mut status: ResMut<StatusMsg>,
-    debris_assets: Res<DebrisAssets>,
+    mut item_assets: ResMut<ItemAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut commands: Commands,
 ) {
     target.0 = None;
@@ -402,22 +373,15 @@ fn mining(
         *swing_accum = 0.0;
     }
 
-    // A full pack blocks ore mining entirely (rather than silently destroying
-    // loot) — this is the pressure that sends you back up to sell.
-    if is_ore && damage > 0.0 && inventory.units >= upgrades.capacity() {
-        damage = 0.0;
-        status.set("Pack full! Sell at the surface shop [E]");
-    }
-
     let mut remaining = *world.damage.get(&v).unwrap_or(&hp_max);
     if damage > 0.0 {
         remaining -= damage;
         if remaining <= 0.0 {
             world.set_air(v);
-            if is_ore {
-                inventory.add(band);
-            }
-            spawn_debris(&mut commands, &debris_assets, v);
+            // Loot is physical now: the block pops out as a drop you walk over
+            // to collect (a full pack just leaves it lying there).
+            items::spawn_drop(&mut commands, &mut item_assets, &mut materials, v, id);
+            items::spawn_block_debris(&mut commands, &item_assets, v);
             target.0 = None;
             return;
         }
@@ -436,39 +400,3 @@ fn mining(
     });
 }
 
-fn spawn_debris(commands: &mut Commands, assets: &DebrisAssets, v: IVec3) {
-    let center = (v.as_vec3() + Vec3::splat(0.5)) * VOXEL;
-    for i in 0..DEBRIS_PER_BLOCK {
-        // Deterministic scatter from the voxel coords — no RNG state needed.
-        let h = ((v.x * 31 + v.z * 17 + v.y * 7 + i as i32 * 13) % 16) as f32 / 16.0;
-        let angle = h * std::f32::consts::TAU + i as f32 * 1.7;
-        let vel = Vec3::new(angle.cos() * 1.5, 2.5 + h, angle.sin() * 1.5);
-        commands.spawn((
-            Mesh3d(assets.mesh.clone()),
-            MeshMaterial3d(assets.material.clone()),
-            Transform::from_translation(center),
-            Debris {
-                vel,
-                ttl: DEBRIS_TTL,
-            },
-        ));
-    }
-}
-
-fn update_debris(
-    time: Res<Time>,
-    mut debris: Query<(Entity, &mut Debris, &mut Transform)>,
-    mut commands: Commands,
-) {
-    let dt = time.delta_secs();
-    for (entity, mut d, mut tf) in &mut debris {
-        d.ttl -= dt;
-        if d.ttl <= 0.0 {
-            commands.entity(entity).despawn();
-            continue;
-        }
-        d.vel.y += GRAVITY * 0.5 * dt;
-        tf.translation += d.vel * dt;
-        tf.rotation *= Quat::from_rotation_x(6.0 * dt) * Quat::from_rotation_y(4.0 * dt);
-    }
-}

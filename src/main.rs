@@ -6,6 +6,7 @@ use std::time::Duration;
 
 mod game;
 mod hud;
+mod items;
 mod player;
 mod world;
 
@@ -51,6 +52,7 @@ fn main() {
             },
             world::WorldPlugin,
             player::PlayerPlugin,
+            items::ItemsPlugin,
             game::GamePlugin,
             hud::HudPlugin,
         ))

@@ -5,6 +5,8 @@ A Bevy 0.18 incremental mining game: first-person 3D voxel digging (0.25m cubes 
 ## Game loop & controls
 
 - Click to grab the cursor. WASD + Space + mouse-look, hold **LMB** to mine the block under the crosshair (RPG-style: tool damage per swing vs block HP).
+- Every destroyed voxel drops physical loot (dirt/stone $1 at band 0, doubling per band; ore much more) that you walk over to magnet-collect; a full pack leaves drops lying on the ground.
+- **Q** tosses a TNT charge: 2s fuse, carves a 4m-radius sphere, every voxel drops loot. Free while the mechanic is being playtested.
 - **E** at the gold shop pad sells the pack; **1/2/3/4** buy damage / swing speed / capacity / recall device. **T** recalls to the surface, **G** dives back to best depth (after buying recall).
 - The whole progression curve (HP/value/cost growth factors) lives in the constants at the top of `src/game.rs` and `src/world.rs`.
 
@@ -78,7 +80,8 @@ Don't build these yet; note them so we don't forget.
 src/
   main.rs    App wiring, sun + depth-based lighting fade, bench-exit hook
   world.rs   Voxel storage/worldgen/meshing/raycast, chunk lifecycle (WorldPlugin)
-  player.rs  First-person controller, voxel AABB collision, mining, debris (PlayerPlugin)
+  player.rs  First-person controller, voxel AABB collision, mining (PlayerPlugin)
+  items.rs   Physical loot drops + pickup magnet, TNT, debris chips (ItemsPlugin)
   game.rs    Wallet/inventory/upgrades/shop/teleports — the incremental economy (GamePlugin)
   hud.rs     Stats, crosshair + target HP bar, shop panel, status line (HudPlugin)
 .cargo/
