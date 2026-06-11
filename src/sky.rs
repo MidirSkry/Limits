@@ -136,6 +136,51 @@ fn fbm(p: Vec3, octaves: u32, salt: u64) -> f32 {
 // Shared mesh builders
 // ---------------------------------------------------------------------------
 
+/// Soft light-streak geometry, the ONLY acceptable shape for a "beam of
+/// light" in this game: two crossed quads, unit-sized (width ±0.5, length
+/// z ∈ ±0.5 with the bright base at +z), vertex alpha 1 on the spine fading
+/// to 0 at the edges and the tip. Solid prisms (cuboids, cones) read as
+/// glowing PLANKS from side-on — every streak (shooting stars, comet tail,
+/// consumption shards) shares this mesh instead.
+pub fn beam_mesh() -> Mesh {
+    const ROWS: usize = 10;
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for plane in 0..2 {
+        let base = positions.len() as u32;
+        for r in 0..=ROWS {
+            let t = r as f32 / ROWS as f32; // 0 = base, 1 = tip
+            let z = 0.5 - t;
+            let w = 0.5 * (1.0 - t).powf(0.6);
+            let b = (1.0 - t).powf(1.3);
+            for cx in [-1.0f32, 0.0, 1.0] {
+                let (x, y) = if plane == 0 { (cx * w, 0.0) } else { (0.0, cx * w) };
+                positions.push([x, y, z]);
+                normals.push([0.0, 1.0, 0.0]);
+                let a = if cx == 0.0 { b } else { 0.0 };
+                colors.push([1.4 * b, 1.4 * b, 1.4 * b, a]);
+            }
+        }
+        for r in 0..ROWS as u32 {
+            let row = base + r * 3;
+            for c in 0..2u32 {
+                let i = row + c;
+                indices.extend_from_slice(&[i, i + 1, i + 3, i + 1, i + 4, i + 3]);
+            }
+        }
+    }
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
 /// Flat ring (annulus) in the XZ plane, radius `inner..outer`, vertex-colored
 /// by `color_fn(t)` where t runs 0 at the inner edge to 1 at the outer.
 pub fn ring_mesh(
@@ -466,45 +511,24 @@ fn setup_celestials(
         ))
         .id();
 
-    // --- A lighthouse pulsar: HDR core + two sweeping beams ------------------
+    // --- A pulsar: a hard-flashing HDR core. (It used to have sweeping beam
+    // geometry — solid light-planks read as exactly that. The strobe alone
+    // says "pulsar".) --------------------------------------------------------
     let pulsar = commands
         .spawn((
+            Mesh3d(meshes.add(Sphere::new(3.0))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::linear_rgb(9.0, 10.0, 14.0),
+                unlit: true,
+                ..default()
+            })),
             Transform::from_translation(PULSAR_DIR.normalize() * 1300.0),
-            Visibility::Visible,
-            RotateSlow {
-                axis: Vec3::new(0.2, 1.0, 0.3).normalize(),
-                rate: 1.4,
+            Twinkle {
+                base: 3.4,
+                phase: 0.0,
+                speed: 9.0,
             },
         ))
-        .with_children(|p| {
-            p.spawn((
-                Mesh3d(meshes.add(Sphere::new(3.0))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::linear_rgb(9.0, 10.0, 14.0),
-                    unlit: true,
-                    ..default()
-                })),
-                Transform::IDENTITY,
-            ));
-            let beam_mat = materials.add(StandardMaterial {
-                base_color: Color::linear_rgba(2.2, 2.8, 4.5, 0.30),
-                unlit: true,
-                alpha_mode: AlphaMode::Add,
-                cull_mode: None,
-                ..default()
-            });
-            let beam = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
-            // Beams tilted off the spin axis so they sweep like a lighthouse.
-            for side in [-1.0f32, 1.0] {
-                p.spawn((
-                    Mesh3d(beam.clone()),
-                    MeshMaterial3d(beam_mat.clone()),
-                    Transform::from_translation(Vec3::new(side * 8.0, 0.0, side * 190.0))
-                        .looking_to(Vec3::new(side * 0.08, 0.0, side * 1.0), Vec3::Y)
-                        .with_scale(Vec3::new(2.0, 2.0, 380.0)),
-                ));
-            }
-        })
         .id();
 
     // --- A comet on a slow tilted orbit, tail blown anti-sunward -------------
@@ -521,17 +545,18 @@ fn setup_celestials(
         ))
         .with_children(|c| {
             c.spawn((
-                Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+                Mesh3d(meshes.add(beam_mesh())),
                 MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::linear_rgba(1.6, 2.2, 2.8, 0.30),
+                    base_color: Color::linear_rgba(1.6, 2.2, 2.8, 0.45),
                     unlit: true,
                     alpha_mode: AlphaMode::Add,
                     cull_mode: None,
                     ..default()
                 })),
-                // Local -Z is "away from the sun" (comet_drift orients us).
+                // Local -Z is "away from the sun" (comet_drift orients us);
+                // the beam's bright base sits at the head, tip trailing off.
                 Transform::from_translation(Vec3::new(0.0, 0.0, -110.0))
-                    .with_scale(Vec3::new(3.5, 3.5, 220.0)),
+                    .with_scale(Vec3::new(16.0, 16.0, 220.0)),
             ));
         })
         .id();
@@ -794,7 +819,7 @@ fn shooting_stars(
         tf.translation += v * dt;
         // Tail stretches early, shrinks as it dies.
         let life = (s.ttl / 2.0).clamp(0.0, 1.0);
-        tf.scale = Vec3::new(1.0, 1.0, 0.4 + life * 1.2);
+        tf.scale = Vec3::new(2.4, 2.4, 34.0 * (0.4 + life * 1.2));
     }
 
     clock.next_in -= dt;
@@ -809,10 +834,12 @@ fn shooting_stars(
     let (mesh, material) = local_assets
         .get_or_insert_with(|| {
             (
-                meshes.add(Cuboid::new(0.7, 0.7, 34.0)),
+                meshes.add(beam_mesh()),
                 materials.add(StandardMaterial {
-                    base_color: Color::linear_rgb(6.0, 7.0, 8.5),
+                    base_color: Color::linear_rgba(6.0, 7.0, 8.5, 0.8),
                     unlit: true,
+                    alpha_mode: AlphaMode::Add,
+                    cull_mode: None,
                     ..default()
                 }),
             )
@@ -831,7 +858,11 @@ fn shooting_stars(
     commands.spawn((
         Mesh3d(mesh),
         MeshMaterial3d(material),
-        Transform::from_translation(pos).looking_to(vel.normalize_or_zero(), Vec3::Y),
+        // Local -Z points BACKWARD so the beam's bright base leads and the
+        // faded tip trails behind the motion.
+        Transform::from_translation(pos)
+            .looking_to(-vel.normalize_or_zero(), Vec3::Y)
+            .with_scale(Vec3::new(2.4, 2.4, 34.0)),
         ShootingStar { vel, ttl: 2.0 },
     ));
 }

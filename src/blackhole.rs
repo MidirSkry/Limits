@@ -227,61 +227,10 @@ struct BhDisc {
     rate_mul: f32,
 }
 
-/// Relativistic polar jet — scales/pulses with how hard the hole is feeding.
-#[derive(Component)]
-struct BhJet {
-    sign: f32,
-}
-
-/// Soft jet geometry: two crossed quads, unit-sized (x,y ∈ ±0.5, z ∈ ±0.5
-/// with the base at +z and the tip at -z), vertex alpha 1 on the spine and 0
-/// at the edges/tip. A stretched cuboid here reads as a solid slab of light
-/// from side-on; this reads as a beam from every angle.
-fn jet_mesh() -> Mesh {
-    const ROWS: usize = 10;
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut colors: Vec<[f32; 4]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-    for plane in 0..2 {
-        let base = positions.len() as u32;
-        for r in 0..=ROWS {
-            let t = r as f32 / ROWS as f32; // 0 = base, 1 = tip
-            let z = 0.5 - t;
-            // Slight flare at the base, tapering to a point.
-            let w = 0.5 * (1.0 - t).powf(0.6);
-            let b = (1.0 - t).powf(1.3);
-            for cx in [-1.0f32, 0.0, 1.0] {
-                let (x, y) = if plane == 0 { (cx * w, 0.0) } else { (0.0, cx * w) };
-                positions.push([x, y, z]);
-                normals.push([0.0, 1.0, 0.0]);
-                let a = if cx == 0.0 { b } else { 0.0 };
-                colors.push([1.4 * b, 1.4 * b, 1.4 * b, a]);
-            }
-        }
-        for r in 0..ROWS as u32 {
-            let row = base + r * 3;
-            for c in 0..2u32 {
-                let i = row + c;
-                indices.extend_from_slice(&[i, i + 1, i + 3, i + 1, i + 4, i + 3]);
-            }
-        }
-    }
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    .with_inserted_indices(Indices::U32(indices))
-}
-
 /// Material handles mutated per frame for the living-glow throb.
 #[derive(Resource)]
 struct BhGlowMats {
     photon: Handle<StandardMaterial>,
-    jet: Handle<StandardMaterial>,
 }
 
 /// Infalling debris streak, animated in disc-local space.
@@ -325,8 +274,9 @@ pub fn spawn_eat_streaks(commands: &mut Commands, fx: &EatFx, from: Vec3, hole: 
         commands.spawn((
             Mesh3d(fx.mesh.clone()),
             MeshMaterial3d(fx.mat.clone()),
+            // Local -Z backward: bright base leads into the hole, tip trails.
             Transform::from_translation(from + side)
-                .looking_to(dir.normalize_or_zero(), Vec3::Y)
+                .looking_to(-dir.normalize_or_zero(), Vec3::Y)
                 .with_scale(Vec3::new(5.0, 5.0, 70.0)),
             EatStreak {
                 vel: dir,
@@ -539,44 +489,15 @@ fn setup_blackhole(
         ))
         .id();
 
-    // Relativistic polar jets along the disc axis — twin lances of blue-white
-    // that lengthen and pulse as the hole feeds harder through the day.
-    let jet_mat = materials.add(StandardMaterial {
-        base_color: Color::linear_rgba(2.6, 4.2, 7.0, 0.40),
-        unlit: true,
-        alpha_mode: AlphaMode::Add,
-        cull_mode: None,
-        ..default()
-    });
-    let jet_mesh = meshes.add(jet_mesh());
-    let mut jets = Vec::new();
-    for sign in [-1.0f32, 1.0] {
-        jets.push(
-            commands
-                .spawn((
-                    Mesh3d(jet_mesh.clone()),
-                    MeshMaterial3d(jet_mat.clone()),
-                    Transform::from_translation(disc_normal * sign * HORIZON_R * 2.8)
-                        .looking_to(disc_normal * sign, Vec3::X)
-                        .with_scale(Vec3::new(
-                            HORIZON_R * 0.30,
-                            HORIZON_R * 0.30,
-                            HORIZON_R * 5.0,
-                        )),
-                    BhJet { sign },
-                ))
-                .id(),
-        );
-    }
-    commands.insert_resource(BhGlowMats {
-        photon: photon_mat,
-        jet: jet_mat,
-    });
+    // (No polar jets: every attempt at beam geometry on the hole — cuboid or
+    // soft — read as a stick of light stapled to the sky. The ring + disc +
+    // halo composite carries the look on its own.)
+    commands.insert_resource(BhGlowMats { photon: photon_mat });
 
     // Infalling debris: streaks spiraling down the disc plane into the
     // horizon. Mix of white-hot plasma and dim rocky chunks — the visible
     // proof that this thing EATS.
-    let streak_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let streak_mesh = meshes.add(crate::sky::beam_mesh());
     let hot_mat = materials.add(StandardMaterial {
         base_color: Color::linear_rgba(9.0, 5.5, 2.5, 0.8),
         unlit: true,
@@ -618,11 +539,10 @@ fn setup_blackhole(
     commands
         .entity(root)
         .add_children(&[horizon, photon, arc, halo, disc, disc_b]);
-    commands.entity(root).add_children(&jets);
 
-    // Consumption-shard assets for lod.rs.
+    // Consumption-shard assets for lod.rs (soft beams, not light-planks).
     commands.insert_resource(EatFx {
-        mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+        mesh: meshes.add(crate::sky::beam_mesh()),
         mat: materials.add(StandardMaterial {
             base_color: Color::linear_rgba(7.0, 4.0, 1.8, 0.8),
             unlit: true,
@@ -807,34 +727,17 @@ fn spin_disc(time: Res<Time>, day: Res<DayState>, mut discs: Query<(&mut BhDisc,
     }
 }
 
-/// Jets lengthen and pulse with feeding intensity; the photon ring breathes.
+/// The photon ring breathes — brighter and faster-pulsing as dread climbs.
 fn bh_glow_throb(
     time: Res<Time>,
-    day: Res<DayState>,
     bh: Res<BlackHole>,
     mats: Res<BhGlowMats>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut jets: Query<(&BhJet, &mut Transform)>,
 ) {
     let t = time.elapsed_secs();
-    let feed = 0.45 + 0.85 * day.frac() + bh.dread * 0.4;
-    for (jet, mut tf) in &mut jets {
-        let pulse = 1.0 + 0.16 * (t * 2.6 + jet.sign).sin();
-        let len = HORIZON_R * (3.2 + 3.4 * feed) * pulse;
-        tf.scale = Vec3::new(
-            HORIZON_R * (0.22 + 0.14 * feed),
-            HORIZON_R * (0.22 + 0.14 * feed),
-            len,
-        );
-        tf.translation = tf.rotation * Vec3::NEG_Z * (len * 0.5 + HORIZON_R * 0.6);
-    }
     if let Some(m) = materials.get_mut(&mats.photon) {
         let b = 1.0 + 0.16 * (t * 2.1).sin() + 0.25 * bh.dread;
         m.base_color = Color::linear_rgb(b, b, b);
-    }
-    if let Some(m) = materials.get_mut(&mats.jet) {
-        let b = (0.55 + 0.75 * feed) * (1.0 + 0.2 * (t * 3.4).sin());
-        m.base_color = Color::linear_rgba(2.6 * b, 4.2 * b, 7.0 * b, 0.40);
     }
 }
 
@@ -866,8 +769,9 @@ fn animate_streaks(
         let inward = -Vec3::new(cos, 0.0, sin);
         let vel_dir = (tangent + inward * 0.22).normalize();
         let len = (s.r * w * frenzy * 0.45).clamp(18.0, 220.0);
+        // Local -Z backward: the beam's bright base leads the motion.
         *tf = Transform::from_translation(pos)
-            .looking_to(vel_dir, Vec3::Y)
+            .looking_to(-vel_dir, Vec3::Y)
             .with_scale(Vec3::new(s.size, s.size, len));
     }
 }
