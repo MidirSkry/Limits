@@ -60,6 +60,8 @@ impl Plugin for LodPlugin {
 struct PlanetImpostor {
     idx: usize,
     center: Vec3,
+    /// Cooldown for shedding matter while inside the hole's tidal zone.
+    shed_cd: f32,
 }
 
 /// (Re)build planet impostors whenever none exist — at boot and on the frame
@@ -95,6 +97,7 @@ fn ensure_planet_impostors(
                 PlanetImpostor {
                     idx,
                     center: p.center,
+                    shed_cd: 0.0,
                 },
             ))
             .with_children(|world_body| {
@@ -156,29 +159,36 @@ fn ensure_planet_impostors(
     }
 }
 
-/// The advancing horizon swallows planets whole. Hide the impostor and fire a
-/// burst of consumption shards — from across the system you see a world die.
+/// The hole takes planets in stages: inside ~2.4 horizon radii a world
+/// tidally deforms — visibly stretching toward the singularity and shedding
+/// streams of matter — and once the horizon itself arrives it dies with a
+/// shard burst and a boom the whole system hears.
 fn planet_consume(
+    time: Res<Time>,
     bh: Res<crate::blackhole::BlackHole>,
     eat_fx: Option<Res<crate::blackhole::EatFx>>,
+    mut sfx: ResMut<crate::audio::SfxQueue>,
     mut imp: ResMut<Impostors>,
-    mut planets: Query<(&PlanetImpostor, &mut Visibility)>,
+    mut planets: Query<(&mut PlanetImpostor, &mut Visibility, &mut Transform)>,
     mut commands: Commands,
 ) {
-    for (p, mut vis) in &mut planets {
+    let dt = time.delta_secs();
+    for (mut p, mut vis, mut tf) in &mut planets {
         if imp.eaten_planets.contains(&p.idx) {
             continue;
         }
-        if p.center.distance(bh.center) < bh.horizon_r {
+        let d = p.center.distance(bh.center);
+        if d < bh.horizon_r {
             imp.eaten_planets.insert(p.idx);
             *vis = Visibility::Hidden;
+            sfx.push(crate::audio::SfxEvent::Explosion);
             if let Some(fx) = &eat_fx {
-                for k in 0..4 {
+                for k in 0..10 {
                     let off = Vec3::new(
                         ((p.idx * 7 + k) % 5) as f32 - 2.0,
                         ((p.idx * 3 + k) % 7) as f32 - 3.0,
                         ((p.idx * 11 + k) % 3) as f32 - 1.0,
-                    ) * 40.0;
+                    ) * 60.0;
                     crate::blackhole::spawn_eat_streaks(
                         &mut commands,
                         fx,
@@ -187,6 +197,29 @@ fn planet_consume(
                     );
                 }
             }
+        } else if bh.horizon_r > 1.0 && d < bh.horizon_r * 2.4 {
+            // Tidal zone: stretch toward the hole, thin across, shed matter.
+            let k = (1.0 - (d - bh.horizon_r) / (bh.horizon_r * 1.4)).clamp(0.0, 1.0);
+            let dir = (bh.center - p.center).normalize_or_zero();
+            tf.rotation = Quat::from_rotation_arc(Vec3::Z, dir);
+            let stretch = 1.0 + 1.1 * k;
+            let thin = 1.0 / stretch.sqrt();
+            tf.scale = Vec3::new(thin, thin, stretch);
+            p.shed_cd -= dt;
+            if p.shed_cd <= 0.0 {
+                p.shed_cd = 2.6 - 2.1 * k;
+                if let Some(fx) = &eat_fx {
+                    crate::blackhole::spawn_eat_streaks(
+                        &mut commands,
+                        fx,
+                        p.center + dir * d.min(400.0) * 0.3,
+                        bh.center,
+                    );
+                }
+            }
+        } else if tf.scale != Vec3::ONE {
+            tf.scale = Vec3::ONE;
+            tf.rotation = Quat::IDENTITY;
         }
     }
 }
@@ -420,21 +453,39 @@ fn impostor_mesh(a: &Asteroid, subdiv: u32) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// Per frame: grow new impostors in, and yield to the voxel chunks up close
-/// (by which point the streamed shell has already drawn over us).
+/// Per frame: grow new impostors in, yield to the voxel chunks up close
+/// (by which point the streamed shell has already drawn over us), and
+/// tidally deform anything inside the hole's kill zone.
 fn impostor_swap(
     time: Res<Time>,
     player: Res<PlayerState>,
+    bh: Res<crate::blackhole::BlackHole>,
     mut impostors: Query<(&mut Impostor, &mut Visibility, &mut Transform)>,
 ) {
     let dt = time.delta_secs();
     for (mut imp, mut vis, mut tf) in &mut impostors {
+        let mut s = 1.0;
         if imp.age < GROW_S {
             imp.age += dt;
             let t = (imp.age / GROW_S).clamp(0.0, 1.0);
             // Ease-out growth.
-            let s = 1.0 - (1.0 - t) * (1.0 - t);
-            tf.scale = Vec3::splat(s.max(0.01));
+            s = (1.0 - (1.0 - t) * (1.0 - t)).max(0.01);
+        }
+        // Inside ~2x the horizon, rocks visibly stretch toward the hole —
+        // the belt doesn't just vanish into it, it gets PULLED.
+        let d = imp.center.distance(bh.center);
+        if bh.horizon_r > 1.0 && d < bh.horizon_r * 2.0 {
+            let k = (1.0 - (d - bh.horizon_r) / bh.horizon_r).clamp(0.0, 1.0);
+            let dir = (bh.center - imp.center).normalize_or_zero();
+            tf.rotation = Quat::from_rotation_arc(Vec3::Z, dir);
+            let stretch = 1.0 + 1.6 * k;
+            tf.scale = Vec3::new(
+                s / stretch.sqrt(),
+                s / stretch.sqrt(),
+                s * stretch,
+            );
+        } else {
+            tf.scale = Vec3::splat(s);
         }
         *vis = if imp.center.distance(player.pos) < SWAP_M {
             Visibility::Hidden

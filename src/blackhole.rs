@@ -56,6 +56,9 @@ const STAR_DETONATE_S: f32 = 4.0;
 const STAR_COLLAPSE_S: f32 = 1.3;
 const HOLE_GROW_S: f32 = 2.6;
 const SHOCK_SPEED: f32 = 1_000.0;
+/// The accretion plane's normal (root-local). Discs, streaks, and the doomed
+/// swarm all share it.
+const DISC_NORMAL: Vec3 = Vec3::new(0.30, 0.90, 0.20);
 
 /// Pull at the home rock at day start / nominal day end (m/s²). Thrust is 16
 /// — past the crossover there is no escape. There is NO timer: past the
@@ -85,6 +88,9 @@ const FALL_IMPACT: f32 = 0.5;
 const DAWN_S: f32 = 3.5;
 
 const N_STREAKS: usize = 64;
+/// Doomed rocks orbiting their last hours: visible matter spiraling into the
+/// disc at all times, so the hole reads as FEEDING, not decoration.
+const N_DOOMED: usize = 30;
 
 // ---------------------------------------------------------------------------
 // State
@@ -198,7 +204,7 @@ impl Plugin for BlackHolePlugin {
                 (
                     (day_cycle, bh_gravity, day_reset).chain().after(crate::GameplaySet),
                     (place_blackhole, billboard_rings, spin_disc, animate_streaks),
-                    (star_cycle, animate_eat_streaks, bh_glow_throb),
+                    (star_cycle, animate_eat_streaks, bh_glow_throb, doomed_swarm),
                 ),
             );
     }
@@ -231,6 +237,38 @@ struct BhDisc {
 #[derive(Resource)]
 struct BhGlowMats {
     photon: Handle<StandardMaterial>,
+}
+
+/// A rock on its final orbits (visual-only matter, child of the root so the
+/// whole feeding zone scales with the hole). Spirals in, flattens into the
+/// disc plane, tidally stretches near the ring, flares on the plunge, and
+/// respawns at the rim as "new" debris.
+#[derive(Component)]
+struct DoomedRock {
+    seed: u64,
+    angle: f32,
+    r: f32,
+    /// Out-of-plane height at the rim — flattens to 0 as it falls in.
+    y0: f32,
+    rate: f32,
+    size: f32,
+    tumble: Vec3,
+}
+
+impl DoomedRock {
+    fn respawn(seed: u64) -> Self {
+        let h = |k: u64| hash01(seed, k);
+        Self {
+            seed,
+            angle: h(0x1) * std::f32::consts::TAU,
+            r: DISC_OUT * (0.85 + 0.45 * h(0x2)),
+            y0: (h(0x3) - 0.5) * DISC_OUT * 0.7,
+            rate: 26.0 + 50.0 * h(0x4),
+            size: 9.0 + 46.0 * h(0x5) * h(0x5),
+            tumble: Vec3::new(h(0x6) - 0.5, h(0x7) - 0.5, h(0x8) - 0.5).normalize_or_zero()
+                * (0.4 + 1.6 * h(0x9)),
+        }
+    }
 }
 
 /// Infalling debris streak, animated in disc-local space.
@@ -304,6 +342,41 @@ fn animate_eat_streaks(
         let frac = (s.ttl / s.ttl_max).clamp(0.0, 1.0);
         tf.scale = Vec3::new(5.0 * frac, 5.0 * frac, 70.0 + 80.0 * (1.0 - frac));
     }
+}
+
+/// A unit-radius jagged lump — ico(1) sphere with hashed radial displacement.
+fn doomed_rock_mesh(seed: u64) -> Mesh {
+    use bevy::mesh::VertexAttributeValues;
+    let base = Sphere::new(1.0).mesh().ico(1).unwrap();
+    let Some(VertexAttributeValues::Float32x3(dirs)) = base.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        unreachable!("sphere mesh has positions");
+    };
+    let mut positions = Vec::with_capacity(dirs.len());
+    let mut normals = Vec::with_capacity(dirs.len());
+    let mut colors = Vec::with_capacity(dirs.len());
+    for (i, d) in dirs.iter().enumerate() {
+        let dir = Vec3::from(*d).normalize_or_zero();
+        let r = 0.74 + 0.5 * hash01(i as u64, seed);
+        positions.push([dir.x * r, dir.y * r, dir.z * r]);
+        normals.push([dir.x, dir.y, dir.z]);
+        let j = 0.55 + 0.45 * hash01(i as u64, seed ^ 0x77);
+        colors.push([j, j * 0.97, j * 0.92, 1.0]);
+    }
+    let indices = base
+        .indices()
+        .unwrap()
+        .iter()
+        .map(|i| i as u32)
+        .collect::<Vec<_>>();
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
 }
 
 fn hash01(i: u64, salt: u64) -> f32 {
@@ -451,7 +524,7 @@ fn setup_blackhole(
     // TWO accretion-disc layers, counter-rotating at different speeds with
     // offset streak patterns — the structure churns instead of spinning like
     // a painted plate. Tilted near-edge-on from the home rock's vantage.
-    let disc_normal = Vec3::new(0.30, 0.90, 0.20).normalize();
+    let disc_normal = DISC_NORMAL.normalize();
     let disc_base = Quat::from_rotation_arc(Vec3::Y, disc_normal);
     let disc = commands
         .spawn((
@@ -493,6 +566,32 @@ fn setup_blackhole(
     // soft — read as a stick of light stapled to the sky. The ring + disc +
     // halo composite carries the look on its own.)
     commands.insert_resource(BhGlowMats { photon: photon_mat });
+
+    // The doomed swarm: low-poly rock lumps on death spirals, silhouetted
+    // against the disc. Four shared jagged meshes, one shared lit material.
+    let rock_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.55, 0.53, 0.50),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+    let rock_meshes: Vec<Handle<Mesh>> = (0..4u64)
+        .map(|k| meshes.add(doomed_rock_mesh(k.wrapping_mul(0xD00D) ^ 0x5EED)))
+        .collect();
+    let mut swarm = Vec::with_capacity(N_DOOMED);
+    for i in 0..N_DOOMED as u64 {
+        let rock = DoomedRock::respawn(i.wrapping_mul(0x9E37_79B9) ^ 0xFEED);
+        swarm.push(
+            commands
+                .spawn((
+                    Mesh3d(rock_meshes[(i % 4) as usize].clone()),
+                    MeshMaterial3d(rock_mat.clone()),
+                    Transform::from_scale(Vec3::splat(rock.size)),
+                    rock,
+                ))
+                .id(),
+        );
+    }
+    commands.entity(root).add_children(&swarm);
 
     // Infalling debris: streaks spiraling down the disc plane into the
     // horizon. Mix of white-hot plasma and dim rocky chunks — the visible
@@ -724,6 +823,60 @@ fn spin_disc(time: Res<Time>, day: Res<DayState>, mut discs: Query<(&mut BhDisc,
     for (mut disc, mut tf) in &mut discs {
         disc.angle += rate * disc.rate_mul * time.delta_secs();
         tf.rotation = disc.base * Quat::from_rotation_y(disc.angle);
+    }
+}
+
+/// March the doomed swarm down their death spirals (root-local space, so the
+/// hole's position and growth come free). Out-of-plane rocks flatten into the
+/// accretion flow, everything tidally stretches along its motion inside ~1.7
+/// horizon radii, and the plunge itself fires a hot shard flare.
+fn doomed_swarm(
+    time: Res<Time>,
+    day: Res<DayState>,
+    bh: Res<BlackHole>,
+    fx: Option<Res<EatFx>>,
+    mut rocks: Query<(&mut DoomedRock, &mut Transform)>,
+    mut commands: Commands,
+) {
+    let dt = time.delta_secs();
+    let frenzy = 1.0 + 2.0 * day.frac()
+        + if day.phase == DayPhase::Falling { 4.0 } else { 0.0 };
+    let n = DISC_NORMAL.normalize();
+    let u = n.cross(Vec3::X).normalize();
+    let v = n.cross(u).normalize();
+    let root_scale = (bh.horizon_r / HORIZON_R).max(0.0001);
+    for (mut rock, mut tf) in &mut rocks {
+        let w = 620.0 / rock.r.max(80.0).powf(1.08);
+        rock.angle += w * frenzy * dt;
+        rock.r -= rock.rate * frenzy * dt * 0.55;
+        if rock.r < HORIZON_R * 1.06 {
+            // The plunge: a flare of shredded matter, then fresh meat at the rim.
+            if let Some(fx) = &fx {
+                let (sin, cos) = rock.angle.sin_cos();
+                let local = (u * cos + v * sin) * rock.r;
+                let world = bh.center + local * root_scale;
+                spawn_eat_streaks(&mut commands, fx, world, bh.center);
+            }
+            let next_seed = rock.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            *rock = DoomedRock::respawn(next_seed);
+        }
+        // Flatten toward the disc plane as the flow circularizes.
+        let flat = ((rock.r - HORIZON_R) / (DISC_OUT - HORIZON_R)).clamp(0.0, 1.0);
+        let (sin, cos) = rock.angle.sin_cos();
+        let radial = u * cos + v * sin;
+        tf.translation = radial * rock.r + n * (rock.y0 * flat * flat);
+        let doom = ((HORIZON_R * 1.7 - rock.r) / (HORIZON_R * 0.64)).clamp(0.0, 1.0);
+        if doom > 0.0 {
+            // Spaghettification: tidally locked, stretched along the flow.
+            let tangent = (-u * sin + v * cos - radial * 0.25).normalize();
+            tf.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, tangent);
+            let stretch = 1.0 + 2.6 * doom;
+            let thin = rock.size / stretch.sqrt();
+            tf.scale = Vec3::new(thin, thin, rock.size * stretch);
+        } else {
+            tf.rotation *= Quat::from_scaled_axis(rock.tumble * dt);
+            tf.scale = Vec3::splat(rock.size);
+        }
     }
 }
 
