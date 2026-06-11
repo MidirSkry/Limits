@@ -233,6 +233,50 @@ struct BhJet {
     sign: f32,
 }
 
+/// Soft jet geometry: two crossed quads, unit-sized (x,y ∈ ±0.5, z ∈ ±0.5
+/// with the base at +z and the tip at -z), vertex alpha 1 on the spine and 0
+/// at the edges/tip. A stretched cuboid here reads as a solid slab of light
+/// from side-on; this reads as a beam from every angle.
+fn jet_mesh() -> Mesh {
+    const ROWS: usize = 10;
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for plane in 0..2 {
+        let base = positions.len() as u32;
+        for r in 0..=ROWS {
+            let t = r as f32 / ROWS as f32; // 0 = base, 1 = tip
+            let z = 0.5 - t;
+            // Slight flare at the base, tapering to a point.
+            let w = 0.5 * (1.0 - t).powf(0.6);
+            let b = (1.0 - t).powf(1.3);
+            for cx in [-1.0f32, 0.0, 1.0] {
+                let (x, y) = if plane == 0 { (cx * w, 0.0) } else { (0.0, cx * w) };
+                positions.push([x, y, z]);
+                normals.push([0.0, 1.0, 0.0]);
+                let a = if cx == 0.0 { b } else { 0.0 };
+                colors.push([1.4 * b, 1.4 * b, 1.4 * b, a]);
+            }
+        }
+        for r in 0..ROWS as u32 {
+            let row = base + r * 3;
+            for c in 0..2u32 {
+                let i = row + c;
+                indices.extend_from_slice(&[i, i + 1, i + 3, i + 1, i + 4, i + 3]);
+            }
+        }
+    }
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
 /// Material handles mutated per frame for the living-glow throb.
 #[derive(Resource)]
 struct BhGlowMats {
@@ -504,7 +548,7 @@ fn setup_blackhole(
         cull_mode: None,
         ..default()
     });
-    let jet_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let jet_mesh = meshes.add(jet_mesh());
     let mut jets = Vec::new();
     for sign in [-1.0f32, 1.0] {
         jets.push(
