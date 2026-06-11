@@ -39,10 +39,10 @@ pub const CELL_M: f32 = 56.0;
 /// destination. A starter rock is guaranteed within a couple of cells of home
 /// (see `starter_cell`).
 const CELL_DENSITY: f32 = 0.018;
-/// Asteroid radii (pre-displacement), small ones common, big ones rare.
-/// Rarer field = bigger rocks, so a find is worth the flight.
+/// Asteroid radii (pre-displacement), small ones common, big ones rare
+/// (cubic skew). Rarer field = bigger rocks, so a find is worth the flight.
 const R_MIN: f32 = 6.0;
-const R_MAX: f32 = 22.0;
+const R_MAX: f32 = 30.0;
 /// Per-asteroid shape ranges (derived from the seed): ellipsoid stretch per
 /// axis, displacement amplitude, and noise frequency. `reach()` and the
 /// overlap pad must bound the extremes.
@@ -63,12 +63,13 @@ pub const TIER_M: f32 = 120.0;
 pub const SYSTEM_AXIS: Vec3 = Vec3::new(-0.65, -0.08, 0.62);
 /// Where the star sits at day start (m from origin) — planets are placed
 /// relative to this so the closest one orbits deep in the kill zone.
-pub const STAR_DIST: f32 = 5_600.0;
+pub const STAR_DIST: f32 = 5_200.0;
 pub const PLANET_COUNT: usize = 6;
-/// Planet radii (pre-displacement). HUGE relative to asteroids — these are
-/// landable worlds, mined exactly like asteroids (same voxel pipeline).
-const PLANET_R_MIN: f32 = 90.0;
-const PLANET_R_MAX: f32 = 240.0;
+/// Planet radii (pre-displacement). HUGE relative to asteroids (up to ~25x
+/// the biggest belt rock) — landable worlds, mined exactly like asteroids
+/// (same voxel pipeline), but cratered, saturated, and haloed in atmosphere.
+const PLANET_R_MIN: f32 = 160.0;
+const PLANET_R_MAX: f32 = 380.0;
 
 /// Regolith shell thickness (m) on every asteroid.
 const SHELL_M: f32 = 0.6;
@@ -310,6 +311,13 @@ pub struct Asteroid {
     /// Displacement amplitude and noise frequency — smooth blob vs crag.
     pub amp: f32,
     pub freq: f32,
+    /// True for the big landable worlds: crater relief, saturated palette,
+    /// atmosphere halo on the impostor.
+    pub is_planet: bool,
+    /// Crater fields (xyz = unit direction, w = angular radius). Depth is a
+    /// fixed fraction of the angular radius; bowls only (no raised rim), so
+    /// `reach()` stays a valid outer bound.
+    pub craters: [Vec4; 4],
 }
 
 /// Per-seed scalar in [0,1) for shape parameters.
@@ -337,10 +345,13 @@ impl Asteroid {
             ),
             amp: AMP_MIN + (AMP_MAX - AMP_MIN) * u(4),
             freq: FREQ_MIN + (FREQ_MAX - FREQ_MIN) * u(5),
+            is_planet: false,
+            craters: [Vec4::ZERO; 4],
         }
     }
 
-    /// Conservative outer bound of the displaced surface.
+    /// Conservative outer bound of the displaced surface (craters only ever
+    /// subtract, so they can't exceed this).
     pub fn reach(&self) -> f32 {
         self.radius * self.stretch.max_element() * (0.95 + self.amp)
     }
@@ -348,7 +359,7 @@ impl Asteroid {
     /// Displaced surface radius along the direction of `p`. Public so the
     /// impostor LOD can build silhouette-matched far meshes from the same
     /// noise. Base shape is an ellipsoid (per-axis stretch), displaced by
-    /// per-asteroid fbm.
+    /// per-asteroid fbm; planets additionally carry crater bowls.
     pub fn surface_toward(&self, p: Vec3) -> f32 {
         let dir = (p - self.center).normalize_or_zero();
         let e = dir / self.stretch;
@@ -358,7 +369,23 @@ impl Asteroid {
             ((self.seed >> 16) & 0xFFFF) as f32,
             ((self.seed >> 32) & 0xFFFF) as f32,
         ) * 0.001;
-        base * ((0.95 - self.amp) + 2.0 * self.amp * fbm(dir * self.freq + s, 3, self.seed))
+        let mut r =
+            base * ((0.95 - self.amp) + 2.0 * self.amp * fbm(dir * self.freq + s, 3, self.seed));
+        if self.is_planet {
+            for c in &self.craters {
+                if c.w <= 0.0 {
+                    continue;
+                }
+                let d = (dir - c.truncate()).length();
+                if d < c.w {
+                    // Smooth bowl: deepest at the center, flush at the lip.
+                    let x = d / c.w;
+                    let bowl = 1.0 - x * x * (3.0 - 2.0 * x);
+                    r -= base * c.w * 0.55 * bowl;
+                }
+            }
+        }
+        r
     }
 }
 
@@ -493,10 +520,24 @@ fn build_planets(salt: u64) -> Vec<Asteroid> {
             // Tier climbs toward the star: 4 (outermost) .. 12 (innermost).
             let tier = 4 + ((i as f32 / (PLANET_COUNT - 1) as f32) * 8.0).round() as i32;
             let mut p = Asteroid::shaped(center, radius, seed, tier);
-            // Worlds, not potatoes: rounder, gentler relief than asteroids.
+            // Worlds, not potatoes: rounder, gentler base relief, then
+            // cratered so the surface reads planetary at any distance.
             p.stretch = Vec3::ONE.lerp(p.stretch, 0.12);
             p.amp = 0.04 + 0.06 * u(4);
             p.freq = 1.2 + 0.8 * u(5);
+            p.is_planet = true;
+            for (k, slot) in p.craters.iter_mut().enumerate() {
+                let kk = 0x40 + k as u64;
+                let z = seed_unit(seed, kk) * 2.0 - 1.0;
+                let a = seed_unit(seed, kk ^ 0x9) * std::f32::consts::TAU;
+                let r = (1.0 - z * z).max(0.0).sqrt();
+                *slot = Vec4::new(
+                    r * a.cos(),
+                    z,
+                    r * a.sin(),
+                    0.18 + 0.30 * seed_unit(seed, kk ^ 0x33),
+                );
+            }
             p
         })
         .collect()
@@ -547,6 +588,8 @@ pub fn asteroid_in_cell(c: IVec3) -> Option<Asteroid> {
             stretch: Vec3::ONE,
             amp: 0.16,
             freq: 2.0,
+            is_planet: false,
+            craters: [Vec4::ZERO; 4],
         });
     }
     let starter = c == starter_cell();
@@ -559,7 +602,7 @@ pub fn asteroid_in_cell(c: IVec3) -> Option<Asteroid> {
         // A respectable first target, never a pebble.
         R_MIN + 4.0 + hash_unit(c, salted(0xA4)) * 6.0
     } else {
-        R_MIN + hash_unit(c, salted(0xA4)).powi(2) * (R_MAX - R_MIN)
+        R_MIN + hash_unit(c, salted(0xA4)).powi(3) * (R_MAX - R_MIN)
     };
     // Keep a clear corridor around the home rock.
     if !starter && center.length() < HOME_R + radius + 10.0 {
@@ -690,24 +733,40 @@ pub fn surface_y_at(x_m: f32, z_m: f32) -> f32 {
     0.0
 }
 
-/// Far-LOD impostor vertex color: the species' rock tone washed toward
-/// regolith grey (what a voxel asteroid averages to at distance), jittered.
-pub fn impostor_color(species: u8, jitter01: f32) -> [f32; 3] {
+/// Far-LOD impostor vertex color. Belt rocks: the species tone washed a
+/// little toward regolith grey and kept DARK with strong per-vertex contrast
+/// — space rock, not candy. Planets: the species tone nearly full-strength
+/// and brighter, so a world reads as a colored body from across the system.
+pub fn impostor_color(species: u8, jitter01: f32, planet: bool) -> [f32; 3] {
     let rock = ROCK_COLORS[(species as usize) % ROCK_COLORS.len()];
-    // Dimmer than face value: a sunlit pastel ball reads as candy, not rock.
-    let j = (0.58 + 0.30 * jitter01) * 0.85;
-    [
-        (rock[0] * 0.6 + 0.24 * 0.4) * j,
-        (rock[1] * 0.6 + 0.22 * 0.4) * j,
-        (rock[2] * 0.6 + 0.20 * 0.4) * j,
-    ]
+    if planet {
+        let j = 0.75 + 0.35 * jitter01;
+        [
+            (rock[0] * 1.15 + 0.03) * j,
+            (rock[1] * 1.15 + 0.03) * j,
+            (rock[2] * 1.15 + 0.03) * j,
+        ]
+    } else {
+        let j = (0.38 + 0.50 * jitter01) * 0.8;
+        [
+            (rock[0] * 0.7 + 0.20 * 0.3) * j,
+            (rock[1] * 0.7 + 0.18 * 0.3) * j,
+            (rock[2] * 0.7 + 0.17 * 0.3) * j,
+        ]
+    }
 }
 
-/// Per-vertex linear color for a block, with a little per-voxel brightness
-/// jitter so untextured cubes don't read as a flat wall of one color. Rock
-/// body color follows the asteroid's species; ore follows the tier; the
-/// regolith shell takes a faint species tint so surfaces differ too.
-fn block_color(id: u8, tier: i32, species: u8, v: IVec3, shell: bool) -> [f32; 3] {
+/// The species' base rock tone — atmosphere tints and other dressing.
+pub fn species_tint(species: u8) -> [f32; 3] {
+    ROCK_COLORS[(species as usize) % ROCK_COLORS.len()]
+}
+
+/// Per-vertex linear color for a block, with strong per-voxel brightness
+/// jitter so untextured cubes read as rubble, not a flat wall. Rock body
+/// color follows the asteroid's species; ore follows the tier. On planets
+/// the regolith takes a heavy species tint (rust-world dust is rust-colored)
+/// so a landed world feels nothing like a belt rock.
+fn block_color(id: u8, tier: i32, species: u8, planet: bool, v: IVec3, shell: bool) -> [f32; 3] {
     let t = tier.max(0) as usize;
     let s = species as usize % ROCK_COLORS.len();
     let base = match id {
@@ -718,18 +777,26 @@ fn block_color(id: u8, tier: i32, species: u8, v: IVec3, shell: bool) -> [f32; 3
             } else {
                 [0.30, 0.275, 0.25]
             };
+            let k = if planet { 0.62 } else { 0.25 };
             [
-                grey[0] * 0.75 + rock[0] * 0.25,
-                grey[1] * 0.75 + rock[1] * 0.25,
-                grey[2] * 0.75 + rock[2] * 0.25,
+                grey[0] * (1.0 - k) + rock[0] * k,
+                grey[1] * (1.0 - k) + rock[1] * k,
+                grey[2] * (1.0 - k) + rock[2] * k,
             ]
         }
-        ROCK => ROCK_COLORS[s],
+        ROCK => {
+            let rock = ROCK_COLORS[s];
+            if planet {
+                [rock[0] * 1.2 + 0.02, rock[1] * 1.2 + 0.02, rock[2] * 1.2 + 0.02]
+            } else {
+                rock
+            }
+        }
         ORE => ORE_COLORS[t % ORE_COLORS.len()],
         BARRIER => [0.09, 0.10, 0.12],
         _ => [1.0, 0.0, 1.0],
     };
-    let j = 0.85 + 0.15 * hash_unit(v, 0xC0102);
+    let j = 0.72 + 0.28 * hash_unit(v, 0xC0102);
     [base[0] * j, base[1] * j, base[2] * j]
 }
 
@@ -1103,17 +1170,17 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
             (a, g)
         })
         .collect();
-    let tier_at = |p: Vec3| -> (i32, u8, bool) {
+    let tier_at = |p: Vec3| -> (i32, u8, bool, bool) {
         for (a, grid) in &grids {
             if p.distance_squared(a.center) > a.reach() * a.reach() {
                 continue;
             }
             let f = grid.sample(p);
             if f > 0.0 {
-                return (a.tier, a.species, f < SHELL_M);
+                return (a.tier, a.species, a.is_planet, f < SHELL_M);
             }
         }
-        (0, 0, false)
+        (0, 0, false, false)
     };
 
     let origin = cp * CHUNK;
@@ -1125,8 +1192,8 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
                 if id == AIR {
                     continue;
                 }
-                let (tier, species, shell) = tier_at(voxel_center_m(v));
-                let col = block_color(id, tier, species, v, shell);
+                let (tier, species, planet, shell) = tier_at(voxel_center_m(v));
+                let col = block_color(id, tier, species, planet, v, shell);
                 let base = (v.as_vec3()) * VOXEL;
                 for face in &FACES {
                     if world.solid(v + face.dir) {
@@ -1429,7 +1496,8 @@ mod tests {
             if i > 0 {
                 assert!(p.tier >= ps[i - 1].tier);
             }
-            assert!(p.radius >= 90.0 && p.radius <= 240.0);
+            assert!(p.radius >= PLANET_R_MIN && p.radius <= PLANET_R_MAX);
+            assert!(p.is_planet);
             // Landable: solid voxels just under the surface, vacuum above —
             // same worldgen pipeline as any asteroid.
             let dir = (Vec3::ZERO - p.center).normalize();

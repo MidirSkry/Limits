@@ -504,7 +504,9 @@ fn audio_watchdog(
     if name == out.device_name {
         return;
     }
-    // Default output changed under us: move there.
+    // Default output changed under us: move there. (Logged so a session's
+    // log proves whether recovery fired — this used to be a hard death.)
+    info!("audio: default output changed {:?} -> {name:?}; rebuilding stream", out.device_name);
     *out = AudioOut::open();
     loops.stop_all();
     start_persistent_loops(out, &sfx, &mut loops);

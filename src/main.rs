@@ -23,12 +23,14 @@ use player::Enclosure;
 pub struct GameplaySet;
 
 /// Hard vacuum: the sun switches off fast once rock swallows the sky.
-const SUN_LUX: f32 = 8_000.0;
+/// Tuned DOWN from 8000: surfaces were tonemapping to blown-out white and
+/// the whole field read as pastel candy. Space rock should sit mid-grey.
+const SUN_LUX: f32 = 4_200.0;
 /// Cool fill from the anti-sun side — physically it's starlight/planetshine,
 /// practically it keeps shadow-side voxel faces from being void-black stripes
 /// against space.
-const FILL_LUX: f32 = 1_000.0;
-const AMBIENT_SURFACE: f32 = 130.0;
+const FILL_LUX: f32 = 700.0;
+const AMBIENT_SURFACE: f32 = 75.0;
 /// Ambient floor in tunnels so unlit faces aren't pure black.
 const AMBIENT_CAVE: f32 = 7.0;
 

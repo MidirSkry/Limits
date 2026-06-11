@@ -38,10 +38,11 @@ const DIST_START: f32 = crate::world::STAR_DIST;
 const DIST_END: f32 = 1_350.0;
 /// Event horizon radius (m) at FULL size. The hole is born at half this and
 /// grows all day as it feeds; visuals scale with it via the root transform.
-const HORIZON_R: f32 = 560.0;
-/// Accretion disc annulus (m), at full size.
-const DISC_IN: f32 = HORIZON_R * 1.45;
-const DISC_OUT: f32 = HORIZON_R * 4.6;
+const HORIZON_R: f32 = 650.0;
+/// Accretion disc annulus (m), at full size — the disc alone spans ~60° of
+/// sky from the home rock at dawn and only grows from there.
+const DISC_IN: f32 = HORIZON_R * 1.40;
+const DISC_OUT: f32 = HORIZON_R * 5.2;
 /// Real-time session length (s). `LIMITS_DAY_S` overrides for testing.
 const DAY_S_DEFAULT: f32 = 600.0;
 
@@ -83,7 +84,7 @@ const FALL_IMPACT: f32 = 0.5;
 /// Dawn fade-in length (s).
 const DAWN_S: f32 = 3.5;
 
-const N_STREAKS: usize = 44;
+const N_STREAKS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // State
@@ -197,7 +198,7 @@ impl Plugin for BlackHolePlugin {
                 (
                     (day_cycle, bh_gravity, day_reset).chain().after(crate::GameplaySet),
                     (place_blackhole, billboard_rings, spin_disc, animate_streaks),
-                    (star_cycle, animate_eat_streaks),
+                    (star_cycle, animate_eat_streaks, bh_glow_throb),
                 ),
             );
     }
@@ -221,6 +222,22 @@ struct BhDisc {
     /// Base orientation (disc plane); spin is applied around its local normal.
     base: Quat,
     angle: f32,
+    /// Spin multiplier — the two disc layers counter-rotate at different
+    /// speeds, so the structure churns instead of turning like a plate.
+    rate_mul: f32,
+}
+
+/// Relativistic polar jet — scales/pulses with how hard the hole is feeding.
+#[derive(Component)]
+struct BhJet {
+    sign: f32,
+}
+
+/// Material handles mutated per frame for the living-glow throb.
+#[derive(Resource)]
+struct BhGlowMats {
+    photon: Handle<StandardMaterial>,
+    jet: Handle<StandardMaterial>,
 }
 
 /// Infalling debris streak, animated in disc-local space.
@@ -302,11 +319,12 @@ fn hash01(i: u64, salt: u64) -> f32 {
     ((x >> 40) as f32) / ((1u64 << 24) as f32)
 }
 
-/// The accretion disc: log-spaced rings (detail bunched at the hot inner
-/// edge), vertex colors carrying temperature (white-hot → ember → violet),
-/// doppler beaming (the approaching side burns brighter), and streaky
-/// azimuthal structure so the spin reads.
-fn disc_mesh() -> Mesh {
+/// One accretion-disc layer: log-spaced rings (detail bunched at the hot
+/// inner edge), vertex colors carrying temperature (white-hot → ember →
+/// violet), doppler beaming (the approaching side burns brighter), and
+/// streaky azimuthal structure so the spin reads. `phase`/`streak_f` vary
+/// per layer so the counter-rotating pair interferes instead of doubling.
+fn disc_mesh(phase: f32, streak_f: f32) -> Mesh {
     const SEG: usize = 180;
     const ROWS: usize = 14;
     let mut positions = Vec::with_capacity((SEG + 1) * (ROWS + 1));
@@ -318,20 +336,22 @@ fn disc_mesh() -> Mesh {
         let radius = DISC_IN * (DISC_OUT / DISC_IN).powf(t);
         let hot = (1.0 - t).powf(2.2);
         let base = Vec3::new(
-            2.2 + 17.0 * hot,
-            0.75 + 10.0 * hot.powf(1.25),
-            0.85 + 5.0 * hot.powf(1.9),
+            2.6 + 19.0 * hot,
+            0.85 + 11.0 * hot.powf(1.25),
+            0.95 + 5.5 * hot.powf(1.9),
         );
         // Gentle outer falloff: the dim violet rim has to survive
         // tonemapping at 5km or the disc reads half its true size.
-        let alpha = (1.0 - t).powf(0.8) * 0.95;
+        let alpha = (1.0 - t).powf(0.8) * 0.8;
         for s in 0..=SEG {
             let a = s as f32 / SEG as f32 * std::f32::consts::TAU;
             positions.push([a.cos() * radius, 0.0, a.sin() * radius]);
             normals.push([0.0, 1.0, 0.0]);
-            let doppler = 0.30 + 1.45 * (0.5 + 0.5 * a.cos()).powf(1.6);
-            let streak =
-                0.62 + 0.38 * ((a * 7.0 + t * 25.0).sin() * (a * 3.0 - t * 11.0).sin()).abs();
+            let doppler = 0.30 + 1.45 * (0.5 + 0.5 * (a + phase).cos()).powf(1.6);
+            let streak = 0.55
+                + 0.45
+                    * ((a * streak_f + phase + t * 25.0).sin() * (a * 3.0 - t * 11.0).sin())
+                        .abs();
             let k = doppler * streak;
             colors.push([base.x * k, base.y * k, base.z * k, alpha]);
         }
@@ -387,12 +407,29 @@ fn setup_blackhole(
         ))
         .id();
 
-    // Photon ring: thin, searing, white-gold. Billboarded.
+    // Photon ring: thin, searing, white-gold — the blazing edge of the
+    // shadow. Billboarded; its material throbs (bh_glow_throb).
+    let photon_mat = materials.add(add_mat());
     let photon = commands
         .spawn((
-            Mesh3d(meshes.add(ring_mesh(HORIZON_R * 1.02, HORIZON_R * 1.30, 128, |t| {
-                let b = (std::f32::consts::PI * t).sin().powf(1.5);
-                [30.0 * b, 24.0 * b, 16.0 * b, b]
+            Mesh3d(meshes.add(ring_mesh(HORIZON_R * 1.02, HORIZON_R * 1.20, 160, |t| {
+                let b = (std::f32::consts::PI * t).sin().powf(1.2);
+                [42.0 * b, 33.0 * b, 21.0 * b, b]
+            }))),
+            MeshMaterial3d(photon_mat.clone()),
+            Transform::IDENTITY,
+            BhBillboard,
+        ))
+        .id();
+
+    // Lensing arc: a second hot annulus just outside the photon ring — the
+    // disc's light bent over the poles. With the tilted disc threading
+    // through it, the composite is unmistakably *that* black hole image.
+    let arc = commands
+        .spawn((
+            Mesh3d(meshes.add(ring_mesh(HORIZON_R * 1.22, HORIZON_R * 1.85, 128, |t| {
+                let b = (1.0 - t).powf(1.6);
+                [14.0 * b, 7.5 * b, 3.2 * b, 0.85 * b]
             }))),
             MeshMaterial3d(materials.add(add_mat())),
             Transform::IDENTITY,
@@ -403,9 +440,9 @@ fn setup_blackhole(
     // Outer glow halo: broad, faint, warm. Billboarded.
     let halo = commands
         .spawn((
-            Mesh3d(meshes.add(ring_mesh(HORIZON_R * 1.22, HORIZON_R * 2.9, 96, |t| {
+            Mesh3d(meshes.add(ring_mesh(HORIZON_R * 1.25, HORIZON_R * 3.4, 96, |t| {
                 let b = (1.0 - t).powf(2.2);
-                [4.5 * b, 2.6 * b, 1.5 * b, 0.55 * b]
+                [5.0 * b, 2.9 * b, 1.6 * b, 0.55 * b]
             }))),
             MeshMaterial3d(materials.add(add_mat())),
             Transform::IDENTITY,
@@ -413,20 +450,73 @@ fn setup_blackhole(
         ))
         .id();
 
-    // Accretion disc, tilted near-edge-on from the home rock's vantage.
+    // TWO accretion-disc layers, counter-rotating at different speeds with
+    // offset streak patterns — the structure churns instead of spinning like
+    // a painted plate. Tilted near-edge-on from the home rock's vantage.
     let disc_normal = Vec3::new(0.30, 0.90, 0.20).normalize();
     let disc_base = Quat::from_rotation_arc(Vec3::Y, disc_normal);
     let disc = commands
         .spawn((
-            Mesh3d(meshes.add(disc_mesh())),
+            Mesh3d(meshes.add(disc_mesh(0.0, 7.0))),
             MeshMaterial3d(materials.add(add_mat())),
             Transform::from_rotation(disc_base),
             BhDisc {
                 base: disc_base,
                 angle: 0.0,
+                rate_mul: 1.0,
             },
         ))
         .id();
+    let disc_b_base = Quat::from_rotation_arc(
+        Vec3::Y,
+        (disc_normal + Vec3::new(0.05, 0.0, -0.04)).normalize(),
+    );
+    let disc_b = commands
+        .spawn((
+            Mesh3d(meshes.add(disc_mesh(2.4, 11.0))),
+            MeshMaterial3d(materials.add(add_mat())),
+            Transform::from_rotation(disc_b_base).with_scale(Vec3::splat(0.985)),
+            BhDisc {
+                base: disc_b_base,
+                angle: 0.0,
+                rate_mul: -0.6,
+            },
+        ))
+        .id();
+
+    // Relativistic polar jets along the disc axis — twin lances of blue-white
+    // that lengthen and pulse as the hole feeds harder through the day.
+    let jet_mat = materials.add(StandardMaterial {
+        base_color: Color::linear_rgba(2.6, 4.2, 7.0, 0.40),
+        unlit: true,
+        alpha_mode: AlphaMode::Add,
+        cull_mode: None,
+        ..default()
+    });
+    let jet_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let mut jets = Vec::new();
+    for sign in [-1.0f32, 1.0] {
+        jets.push(
+            commands
+                .spawn((
+                    Mesh3d(jet_mesh.clone()),
+                    MeshMaterial3d(jet_mat.clone()),
+                    Transform::from_translation(disc_normal * sign * HORIZON_R * 2.8)
+                        .looking_to(disc_normal * sign, Vec3::X)
+                        .with_scale(Vec3::new(
+                            HORIZON_R * 0.30,
+                            HORIZON_R * 0.30,
+                            HORIZON_R * 5.0,
+                        )),
+                    BhJet { sign },
+                ))
+                .id(),
+        );
+    }
+    commands.insert_resource(BhGlowMats {
+        photon: photon_mat,
+        jet: jet_mat,
+    });
 
     // Infalling debris: streaks spiraling down the disc plane into the
     // horizon. Mix of white-hot plasma and dim rocky chunks — the visible
@@ -472,7 +562,8 @@ fn setup_blackhole(
     commands.entity(disc).add_children(&streaks);
     commands
         .entity(root)
-        .add_children(&[horizon, photon, halo, disc]);
+        .add_children(&[horizon, photon, arc, halo, disc, disc_b]);
+    commands.entity(root).add_children(&jets);
 
     // Consumption-shard assets for lod.rs.
     commands.insert_resource(EatFx {
@@ -653,11 +744,42 @@ fn billboard_rings(
 
 fn spin_disc(time: Res<Time>, day: Res<DayState>, mut discs: Query<(&mut BhDisc, &mut Transform)>) {
     // The disc churns faster as the day runs out — feeding frenzy.
-    let rate = 0.010 + 0.05 * day.frac() * day.frac()
-        + if day.phase == DayPhase::Falling { 0.25 } else { 0.0 };
+    let rate = 0.045 + 0.09 * day.frac() * day.frac()
+        + if day.phase == DayPhase::Falling { 0.35 } else { 0.0 };
     for (mut disc, mut tf) in &mut discs {
-        disc.angle += rate * time.delta_secs();
+        disc.angle += rate * disc.rate_mul * time.delta_secs();
         tf.rotation = disc.base * Quat::from_rotation_y(disc.angle);
+    }
+}
+
+/// Jets lengthen and pulse with feeding intensity; the photon ring breathes.
+fn bh_glow_throb(
+    time: Res<Time>,
+    day: Res<DayState>,
+    bh: Res<BlackHole>,
+    mats: Res<BhGlowMats>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut jets: Query<(&BhJet, &mut Transform)>,
+) {
+    let t = time.elapsed_secs();
+    let feed = 0.45 + 0.85 * day.frac() + bh.dread * 0.4;
+    for (jet, mut tf) in &mut jets {
+        let pulse = 1.0 + 0.16 * (t * 2.6 + jet.sign).sin();
+        let len = HORIZON_R * (3.2 + 3.4 * feed) * pulse;
+        tf.scale = Vec3::new(
+            HORIZON_R * (0.22 + 0.14 * feed),
+            HORIZON_R * (0.22 + 0.14 * feed),
+            len,
+        );
+        tf.translation = tf.rotation * Vec3::NEG_Z * (len * 0.5 + HORIZON_R * 0.6);
+    }
+    if let Some(m) = materials.get_mut(&mats.photon) {
+        let b = 1.0 + 0.16 * (t * 2.1).sin() + 0.25 * bh.dread;
+        m.base_color = Color::linear_rgb(b, b, b);
+    }
+    if let Some(m) = materials.get_mut(&mats.jet) {
+        let b = (0.55 + 0.75 * feed) * (1.0 + 0.2 * (t * 3.4).sin());
+        m.base_color = Color::linear_rgba(2.6 * b, 4.2 * b, 7.0 * b, 0.40);
     }
 }
 

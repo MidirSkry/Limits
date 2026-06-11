@@ -30,8 +30,8 @@ const SWAP_M: f32 = 38.0;
 const INSET_M: f32 = 0.30;
 /// New impostors scale up over this long so frontier spawns emerge softly.
 const GROW_S: f32 = 1.1;
-/// Impostor meshes built per frame (each ~160 verts; keep hitches invisible).
-const BUILD_BUDGET: usize = 12;
+/// Impostor meshes built per frame (each ~640 verts; keep hitches invisible).
+const BUILD_BUDGET: usize = 8;
 /// Frames between discovery/cleanup sweeps.
 const SWEEP_INTERVAL: u32 = 29;
 
@@ -86,9 +86,10 @@ fn ensure_planet_impostors(
         .clone();
     let planets = world::planet_list();
     for (idx, p) in planets.iter().enumerate() {
+        let tint = world::species_tint(p.species);
         let e = commands
             .spawn((
-                Mesh3d(meshes.add(impostor_mesh(p, 4))),
+                Mesh3d(meshes.add(impostor_mesh(p, 5))),
                 MeshMaterial3d(material.clone()),
                 Transform::from_translation(p.center),
                 PlanetImpostor {
@@ -96,6 +97,60 @@ fn ensure_planet_impostors(
                     center: p.center,
                 },
             ))
+            .with_children(|world_body| {
+                // Atmosphere halo: a species-tinted additive shell. THE thing
+                // that says "planet" instead of "large rock" at any distance.
+                world_body.spawn((
+                    Mesh3d(meshes.add(Sphere::new(p.reach() * 1.045).mesh().ico(4).unwrap())),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::linear_rgba(
+                            0.10 + tint[0] * 0.55,
+                            0.10 + tint[1] * 0.55,
+                            0.12 + tint[2] * 0.55,
+                            0.20,
+                        ),
+                        unlit: true,
+                        alpha_mode: AlphaMode::Add,
+                        cull_mode: None,
+                        ..default()
+                    })),
+                    Transform::IDENTITY,
+                ));
+                // A third of the worlds get rings.
+                if p.seed % 3 == 0 {
+                    world_body.spawn((
+                        Mesh3d(meshes.add(crate::sky::ring_mesh(
+                            p.reach() * 1.5,
+                            p.reach() * 2.5,
+                            96,
+                            |t| {
+                                let bands = (0.5 + 0.5 * (t * 31.0).sin()).powf(1.4);
+                                let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
+                                let a = 0.04 + 0.22 * bands * edge;
+                                [
+                                    0.5 + tint[0] * 0.8,
+                                    0.5 + tint[1] * 0.8,
+                                    0.5 + tint[2] * 0.8,
+                                    a,
+                                ]
+                            },
+                        ))),
+                        MeshMaterial3d(materials.add(StandardMaterial {
+                            base_color: Color::WHITE,
+                            unlit: true,
+                            alpha_mode: AlphaMode::Add,
+                            cull_mode: None,
+                            ..default()
+                        })),
+                        Transform::from_rotation(Quat::from_euler(
+                            EulerRot::XYZ,
+                            0.3 + (p.seed % 7) as f32 * 0.1,
+                            0.0,
+                            0.2,
+                        )),
+                    ));
+                }
+            })
             .id();
         imp.planets.push(e);
     }
@@ -306,7 +361,7 @@ fn impostor_build(
         }
         let entity = commands
             .spawn((
-                Mesh3d(meshes.add(impostor_mesh(&a, 2))),
+                Mesh3d(meshes.add(impostor_mesh(&a, 3))),
                 MeshMaterial3d(material.clone()),
                 Transform::from_translation(a.center).with_scale(Vec3::splat(0.01)),
                 Impostor {
@@ -346,7 +401,7 @@ fn impostor_mesh(a: &Asteroid, subdiv: u32) -> Mesh {
         normals.push([dir.x, dir.y, dir.z]);
         let jitter = ((i as u64).wrapping_mul(0x9E37_79B9).wrapping_add(a.seed) % 255) as f32
             / 255.0;
-        let c = world::impostor_color(a.species, jitter);
+        let c = world::impostor_color(a.species, jitter, a.is_planet);
         colors.push([c[0], c[1], c[2], 1.0]);
     }
     let indices = base
