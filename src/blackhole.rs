@@ -335,21 +335,25 @@ fn disc_mesh(phase: f32, streak_f: f32) -> Mesh {
         let t = r as f32 / ROWS as f32;
         let radius = DISC_IN * (DISC_OUT / DISC_IN).powf(t);
         let hot = (1.0 - t).powf(2.2);
+        // Blackbody run: white-gold core → orange → deep ember red. Blue
+        // exists only near the core — blue+red in the rim is what made the
+        // old disc read as flat salmon.
         let base = Vec3::new(
-            2.6 + 19.0 * hot,
-            0.85 + 11.0 * hot.powf(1.25),
-            0.95 + 5.5 * hot.powf(1.9),
+            1.4 + 20.0 * hot,
+            0.34 + 14.0 * hot.powf(1.4),
+            0.05 + 9.0 * hot.powf(2.6),
         );
-        // Gentle outer falloff: the dim violet rim has to survive
-        // tonemapping at 5km or the disc reads half its true size.
-        let alpha = (1.0 - t).powf(0.8) * 0.8;
+        let alpha = (1.0 - t).powf(1.3) * 0.78;
+        // Structure carries more of the rim: deeper streak modulation with
+        // radius, so the outer disc is wispy filaments, not a solid wash.
+        let depth = 0.40 + 0.45 * t;
         for s in 0..=SEG {
             let a = s as f32 / SEG as f32 * std::f32::consts::TAU;
             positions.push([a.cos() * radius, 0.0, a.sin() * radius]);
             normals.push([0.0, 1.0, 0.0]);
             let doppler = 0.30 + 1.45 * (0.5 + 0.5 * (a + phase).cos()).powf(1.6);
-            let streak = 0.55
-                + 0.45
+            let streak = (1.0 - depth)
+                + depth
                     * ((a * streak_f + phase + t * 25.0).sin() * (a * 3.0 - t * 11.0).sin())
                         .abs();
             let k = doppler * streak;
@@ -429,7 +433,7 @@ fn setup_blackhole(
         .spawn((
             Mesh3d(meshes.add(ring_mesh(HORIZON_R * 1.22, HORIZON_R * 1.85, 128, |t| {
                 let b = (1.0 - t).powf(1.6);
-                [14.0 * b, 7.5 * b, 3.2 * b, 0.85 * b]
+                [13.0 * b, 6.6 * b, 1.9 * b, 0.85 * b]
             }))),
             MeshMaterial3d(materials.add(add_mat())),
             Transform::IDENTITY,
@@ -441,8 +445,8 @@ fn setup_blackhole(
     let halo = commands
         .spawn((
             Mesh3d(meshes.add(ring_mesh(HORIZON_R * 1.25, HORIZON_R * 3.4, 96, |t| {
-                let b = (1.0 - t).powf(2.2);
-                [5.0 * b, 2.9 * b, 1.6 * b, 0.55 * b]
+                let b = (1.0 - t).powf(2.4);
+                [4.6 * b, 2.5 * b, 0.8 * b, 0.45 * b]
             }))),
             MeshMaterial3d(materials.add(add_mat())),
             Transform::IDENTITY,
@@ -474,7 +478,14 @@ fn setup_blackhole(
     let disc_b = commands
         .spawn((
             Mesh3d(meshes.add(disc_mesh(2.4, 11.0))),
-            MeshMaterial3d(materials.add(add_mat())),
+            // Dimmer second layer: it's there for churn, not brightness.
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::linear_rgb(0.55, 0.55, 0.55),
+                unlit: true,
+                alpha_mode: AlphaMode::Add,
+                cull_mode: None,
+                ..default()
+            })),
             Transform::from_rotation(disc_b_base).with_scale(Vec3::splat(0.985)),
             BhDisc {
                 base: disc_b_base,

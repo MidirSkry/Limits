@@ -497,13 +497,21 @@ fn cell_of(p: Vec3) -> IVec3 {
 // one as it advances through the day. Pure function of the world salt.
 // ---------------------------------------------------------------------------
 
-/// Build the day's planets from a salt. Index 0 is nearest home (lowest
-/// tier); the last is deep in the star's kill zone (highest tier).
+/// Build the day's planets from a salt: ORBITS around the star's seat, the
+/// way they sat when it was a sun. A shared ecliptic plane (containing the
+/// home belt — we're part of this system), orbital radii from deep in the
+/// kill zone out to belt range, and golden-angle longitude spacing so the
+/// worlds scatter all around the star instead of clumping on one bearing.
+/// Index 0 is the innermost orbit (highest tier — the endgame lives closest
+/// to the dying star); the last is the outermost (lowest tier).
 fn build_planets(salt: u64) -> Vec<Asteroid> {
     let axis = SYSTEM_AXIS.normalize();
-    // Two perpendicular directions to scatter planets off the axis.
+    let seat = axis * STAR_DIST;
+    // Ecliptic basis: the plane spanned by the system axis and a horizon
+    // vector — home sits (roughly) in this plane, like a belt should.
     let side = axis.cross(Vec3::Y).normalize();
     let up = axis.cross(side).normalize();
+    const GOLDEN: f32 = 2.399_963; // radians — maximally spread longitudes
     (0..PLANET_COUNT)
         .map(|i| {
             let seed = hash3(
@@ -511,14 +519,18 @@ fn build_planets(salt: u64) -> Vec<Asteroid> {
                 salt.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x7AB1_E7,
             );
             let u = |k: u64| seed_unit(seed, k);
-            let t = (i as f32 + 1.0) / (PLANET_COUNT as f32 + 1.0);
-            let along = 900.0 + t * (STAR_DIST - 1_200.0 - 900.0);
-            let lateral = 450.0 + 900.0 * u(1);
-            let ang = u(2) * std::f32::consts::TAU;
-            let center = axis * along + (side * ang.cos() + up * ang.sin()) * lateral;
+            let t = i as f32 / (PLANET_COUNT - 1) as f32;
+            // Orbital radius from the seat: 1.05km (kill zone) .. 4.6km.
+            let orbit_r = 1_050.0 + t * 3_550.0;
+            let lon = i as f32 * GOLDEN + (u(2) - 0.5) * 0.8 + salt as f32 * 0.7;
+            // Slight per-planet inclination so the band has depth.
+            let incl = (u(6) - 0.5) * 0.24;
+            let center = seat
+                + (axis * lon.cos() + side * lon.sin()) * orbit_r * incl.cos()
+                + up * orbit_r * incl.sin();
             let radius = PLANET_R_MIN + (PLANET_R_MAX - PLANET_R_MIN) * u(3);
-            // Tier climbs toward the star: 4 (outermost) .. 12 (innermost).
-            let tier = 4 + ((i as f32 / (PLANET_COUNT - 1) as f32) * 8.0).round() as i32;
+            // Tier falls with orbital distance: 12 (innermost) .. 4 (outer).
+            let tier = 12 - (t * 8.0).round() as i32;
             let mut p = Asteroid::shaped(center, radius, seed, tier);
             // Worlds, not potatoes: rounder, gentler base relief, then
             // cratered so the surface reads planetary at any distance.
@@ -1486,16 +1498,22 @@ mod tests {
         let ps2 = planet_list();
         assert_eq!(ps[0].center, ps2[0].center);
         let axis = SYSTEM_AXIS.normalize();
-        let mut last_along = 0.0;
+        let seat = axis * STAR_DIST;
+        let side = axis.cross(Vec3::Y).normalize();
+        let mut last_orbit = 0.0;
+        let mut longitudes = Vec::new();
         for (i, p) in ps.iter().enumerate() {
-            // Strung outward along the system axis, tiers climbing toward
-            // the star — the endgame lives in the kill zone.
-            let along = p.center.dot(axis);
-            assert!(along > last_along, "planet {i} out of order");
-            last_along = along;
+            // Concentric orbits around the star's seat, tiers falling with
+            // orbital distance — the endgame lives closest to the dying star.
+            let orbit = p.center.distance(seat);
+            assert!(orbit > last_orbit, "planet {i} orbit out of order");
+            assert!(orbit > 900.0 && orbit < 4_800.0);
+            last_orbit = orbit;
             if i > 0 {
-                assert!(p.tier >= ps[i - 1].tier);
+                assert!(p.tier <= ps[i - 1].tier);
             }
+            let rel = p.center - seat;
+            longitudes.push(f32::atan2(rel.dot(side), rel.dot(axis)));
             assert!(p.radius >= PLANET_R_MIN && p.radius <= PLANET_R_MAX);
             assert!(p.is_planet);
             // Landable: solid voxels just under the surface, vacuum above —
@@ -1511,7 +1529,18 @@ mod tests {
             // Mining it pays its own tier.
             assert_eq!(tier_of_voxel(v_solid), p.tier);
         }
-        assert!(ps.last().unwrap().tier >= 10, "innermost planet must be endgame");
+        assert!(ps.first().unwrap().tier >= 10, "innermost planet must be endgame");
+        // Spread around the star, not clumped on one bearing: the largest
+        // empty arc between neighboring longitudes stays under half a turn.
+        longitudes.sort_by(f32::total_cmp);
+        let mut max_gap: f32 = 0.0;
+        for w in longitudes.windows(2) {
+            max_gap = max_gap.max(w[1] - w[0]);
+        }
+        max_gap = max_gap.max(
+            longitudes[0] + std::f32::consts::TAU - longitudes[longitudes.len() - 1],
+        );
+        assert!(max_gap < std::f32::consts::PI, "planets clumped: gap {max_gap}");
     }
 
     #[test]
