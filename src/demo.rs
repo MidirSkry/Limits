@@ -36,7 +36,7 @@ impl Plugin for DemoPlugin {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct DemoState {
-    target: Option<crate::world::Asteroid>,
+    target: Option<(IVec3, crate::world::Asteroid)>,
     arrived_at: Option<f32>,
     bombed_at: Option<f32>,
     heading_home_at: Option<f32>,
@@ -76,6 +76,7 @@ fn run_demo(
     mut focused: ResMut<Focused>,
     mut player: ResMut<PlayerState>,
     bh: Res<crate::blackhole::BlackHole>,
+    world_res: Res<crate::world::VoxelWorld>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut mouse: ResMut<ButtonInput<MouseButton>>,
     mut state: Local<DemoState>,
@@ -87,8 +88,8 @@ fn run_demo(
 
     // Pick the flight target once: the nearest non-home asteroid.
     if state.target.is_none() {
-        if let Some(a) = crate::world::nearest_asteroid(player.pos, true) {
-            state.target = Some(a);
+        if let Some((cell, a)) = crate::world::nearest_asteroid_keyed(player.pos, true) {
+            state.target = Some((cell, a));
             eprintln!(
                 "[demo] target asteroid at ({:.0},{:.0},{:.0}) r~{:.0} dist {:.0}m",
                 a.center.x,
@@ -100,12 +101,14 @@ fn run_demo(
         }
     }
     let (target_c, target_dist) = match &state.target {
-        Some(a) => {
-            let to = a.center - player.eye();
-            // True surface distance along our approach — asteroids are lumpy
-            // ellipsoids now, so reach() can overshoot the real ground by
-            // 10m+ and strand the tour hovering in vacuum.
-            (a.center, to.length() - a.surface_toward(player.eye()))
+        Some((cell, a)) => {
+            // Bodies MOVE now — chase the displaced position, and measure to
+            // the true surface along our approach (reach() overshoots the
+            // lumpy ellipsoids by 10m+ and would strand the tour hovering).
+            let current = a.center + world_res.offset_of(*cell);
+            let to = current - player.eye();
+            let surf = a.surface_toward(player.eye() - world_res.offset_of(*cell));
+            (current, to.length() - surf)
         }
         None => {
             let c = Vec3::new(60.0, 0.0, 60.0);

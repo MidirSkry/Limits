@@ -159,15 +159,16 @@ fn ensure_planet_impostors(
     }
 }
 
-/// The hole takes planets in stages: inside ~2.4 horizon radii a world
-/// tidally deforms — visibly stretching toward the singularity and shedding
-/// streams of matter — and once the horizon itself arrives it dies with a
-/// shard burst and a boom the whole system hears.
+/// The hole takes planets in stages: the BODY (voxels and all) is dragged in
+/// for real by world::body_motion — here the impostor follows that motion,
+/// tidally deforms inside ~2.4 horizon radii (stretching toward the
+/// singularity, shedding streams of matter), and throws a shard burst the
+/// moment the world's actual chunks are consumed.
 fn planet_consume(
     time: Res<Time>,
     bh: Res<crate::blackhole::BlackHole>,
+    world_res: Res<crate::world::VoxelWorld>,
     eat_fx: Option<Res<crate::blackhole::EatFx>>,
-    mut sfx: ResMut<crate::audio::SfxQueue>,
     mut imp: ResMut<Impostors>,
     mut planets: Query<(&mut PlanetImpostor, &mut Visibility, &mut Transform)>,
     mut commands: Commands,
@@ -177,11 +178,12 @@ fn planet_consume(
         if imp.eaten_planets.contains(&p.idx) {
             continue;
         }
-        let d = p.center.distance(bh.center);
-        if d < bh.horizon_r {
+        let key = world::planet_key(p.idx);
+        let current = p.center + world_res.offset_of(key);
+        tf.translation = current;
+        if world_res.is_eaten(key) {
             imp.eaten_planets.insert(p.idx);
             *vis = Visibility::Hidden;
-            sfx.push(crate::audio::SfxEvent::Explosion);
             if let Some(fx) = &eat_fx {
                 for k in 0..10 {
                     let off = Vec3::new(
@@ -192,15 +194,18 @@ fn planet_consume(
                     crate::blackhole::spawn_eat_streaks(
                         &mut commands,
                         fx,
-                        p.center + off,
+                        current + off,
                         bh.center,
                     );
                 }
             }
-        } else if bh.horizon_r > 1.0 && d < bh.horizon_r * 2.4 {
+            continue;
+        }
+        let d = current.distance(bh.center);
+        if bh.horizon_r > 1.0 && d < bh.horizon_r * 2.4 {
             // Tidal zone: stretch toward the hole, thin across, shed matter.
             let k = (1.0 - (d - bh.horizon_r) / (bh.horizon_r * 1.4)).clamp(0.0, 1.0);
-            let dir = (bh.center - p.center).normalize_or_zero();
+            let dir = (bh.center - current).normalize_or_zero();
             tf.rotation = Quat::from_rotation_arc(Vec3::Z, dir);
             let stretch = 1.0 + 1.1 * k;
             let thin = 1.0 / stretch.sqrt();
@@ -212,7 +217,7 @@ fn planet_consume(
                     crate::blackhole::spawn_eat_streaks(
                         &mut commands,
                         fx,
-                        p.center + dir * d.min(400.0) * 0.3,
+                        current + dir * d.min(400.0) * 0.3,
                         bh.center,
                     );
                 }
@@ -226,7 +231,9 @@ fn planet_consume(
 
 #[derive(Component)]
 struct Impostor {
+    /// Gen-space center; the body's live offset is added every frame.
     center: Vec3,
+    cell: IVec3,
     age: f32,
 }
 
@@ -265,12 +272,12 @@ impl Impostors {
     }
 }
 
-/// Discover asteroid cells entering range; retire impostors far behind us;
-/// feed rocks the advancing event horizon has reached to the hole.
+/// Discover asteroid cells entering range; retire impostors far behind us or
+/// consumed by the hole (the BODIES are eaten for real by world::body_motion;
+/// here we just free the matching impostor entity).
 fn impostor_sweep(
     player: Res<PlayerState>,
-    bh: Res<crate::blackhole::BlackHole>,
-    eat_fx: Option<Res<crate::blackhole::EatFx>>,
+    world_res: Res<crate::world::VoxelWorld>,
     mut imp: ResMut<Impostors>,
     mut commands: Commands,
     mut tick: Local<u32>,
@@ -286,18 +293,17 @@ fn impostor_sweep(
         for cy in -r_cells..=r_cells {
             for cx in -r_cells..=r_cells {
                 let cell = pc + IVec3::new(cx, cy, cz);
-                if imp.map.contains_key(&cell) || imp.eaten.contains(&cell) {
+                if imp.map.contains_key(&cell)
+                    || imp.eaten.contains(&cell)
+                    || world_res.is_eaten(cell)
+                {
                     continue;
                 }
                 let Some(a) = world::asteroid_in_cell(cell) else {
                     continue;
                 };
-                if a.center.distance(player.pos) > IMPOSTOR_RADIUS_M {
-                    continue;
-                }
-                // Already inside the hole: consumed before we ever saw it.
-                if a.center.distance(bh.center) < bh.horizon_r {
-                    imp.eaten.insert(cell);
+                let current = a.center + world_res.offset_of(cell);
+                if current.distance(player.pos) > IMPOSTOR_RADIUS_M {
                     continue;
                 }
                 imp.map.insert(cell, Entity::PLACEHOLDER);
@@ -306,28 +312,17 @@ fn impostor_sweep(
         }
     }
 
-    // Consumption pass: any impostor the horizon has reached is despawned
-    // with a shard of light streaking into the hole, and marked eaten so it
-    // never pops back in the hole's wake. The dawn reset clears the set.
+    // Free impostors of bodies the hole has actually eaten.
     let consumed: Vec<IVec3> = imp
         .map
         .iter()
-        .filter(|(cell, e)| {
-            **e != Entity::PLACEHOLDER
-                && ((cell.as_vec3() + Vec3::splat(0.5)) * CELL_M).distance(bh.center)
-                    < bh.horizon_r + CELL_M * 0.5
-        })
+        .filter(|(cell, e)| **e != Entity::PLACEHOLDER && world_res.is_eaten(**cell))
         .map(|(c, _)| *c)
         .collect();
     for cell in consumed {
         imp.eaten.insert(cell);
         if let Some(e) = imp.map.remove(&cell) {
             commands.entity(e).despawn();
-            if let Some(fx) = &eat_fx {
-                if let Some(a) = world::asteroid_in_cell(cell) {
-                    crate::blackhole::spawn_eat_streaks(&mut commands, fx, a.center, bh.center);
-                }
-            }
         }
     }
 
@@ -359,7 +354,7 @@ fn impostor_sweep(
 
 /// Build queued impostor meshes, a few per frame.
 fn impostor_build(
-    bh: Res<crate::blackhole::BlackHole>,
+    world_res: Res<crate::world::VoxelWorld>,
     mut imp: ResMut<Impostors>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -386,8 +381,8 @@ fn impostor_build(
         let Some(a) = world::asteroid_in_cell(cell) else {
             continue;
         };
-        // The horizon may have reached a queued rock before its build slot.
-        if a.center.distance(bh.center) < bh.horizon_r {
+        // The hole may have eaten a queued rock before its build slot.
+        if world_res.is_eaten(cell) {
             imp.map.remove(&cell);
             imp.eaten.insert(cell);
             continue;
@@ -399,6 +394,7 @@ fn impostor_build(
                 Transform::from_translation(a.center).with_scale(Vec3::splat(0.01)),
                 Impostor {
                     center: a.center,
+                    cell,
                     age: 0.0,
                 },
             ))
@@ -453,17 +449,26 @@ fn impostor_mesh(a: &Asteroid, subdiv: u32) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// Per frame: grow new impostors in, yield to the voxel chunks up close
-/// (by which point the streamed shell has already drawn over us), and
-/// tidally deform anything inside the hole's kill zone.
+/// Per frame: follow each body's REAL displaced position, grow new impostors
+/// in, yield to the voxel chunks up close (by which point the streamed shell
+/// has already drawn over us), and tidally deform anything inside the hole's
+/// kill zone.
 fn impostor_swap(
     time: Res<Time>,
     player: Res<PlayerState>,
     bh: Res<crate::blackhole::BlackHole>,
+    world: Res<crate::world::VoxelWorld>,
     mut impostors: Query<(&mut Impostor, &mut Visibility, &mut Transform)>,
 ) {
     let dt = time.delta_secs();
     for (mut imp, mut vis, mut tf) in &mut impostors {
+        // The body's true position: gen center + the infall it has suffered.
+        let current = imp.center + world.offset_of(imp.cell);
+        tf.translation = current;
+        if world.is_eaten(imp.cell) {
+            *vis = Visibility::Hidden;
+            continue;
+        }
         let mut s = 1.0;
         if imp.age < GROW_S {
             imp.age += dt;
@@ -471,12 +476,12 @@ fn impostor_swap(
             // Ease-out growth.
             s = (1.0 - (1.0 - t) * (1.0 - t)).max(0.01);
         }
-        // Inside ~2x the horizon, rocks visibly stretch toward the hole —
-        // the belt doesn't just vanish into it, it gets PULLED.
-        let d = imp.center.distance(bh.center);
+        // Inside ~2x the horizon, rocks visibly stretch toward the hole on
+        // top of their real motion.
+        let d = current.distance(bh.center);
         if bh.horizon_r > 1.0 && d < bh.horizon_r * 2.0 {
             let k = (1.0 - (d - bh.horizon_r) / bh.horizon_r).clamp(0.0, 1.0);
-            let dir = (bh.center - imp.center).normalize_or_zero();
+            let dir = (bh.center - current).normalize_or_zero();
             tf.rotation = Quat::from_rotation_arc(Vec3::Z, dir);
             let stretch = 1.0 + 1.6 * k;
             tf.scale = Vec3::new(
@@ -487,7 +492,7 @@ fn impostor_swap(
         } else {
             tf.scale = Vec3::splat(s);
         }
-        *vis = if imp.center.distance(player.pos) < SWAP_M {
+        *vis = if current.distance(player.pos) < SWAP_M {
             Visibility::Hidden
         } else {
             Visibility::Visible

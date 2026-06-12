@@ -10,8 +10,7 @@ use crate::audio::{SfxEvent, SfxQueue};
 use crate::game::Upgrades;
 use crate::items::{self, ItemAssets};
 use crate::world::{
-    self, block_display_name, block_hp, raycast, voxel_env, VoxelWorld, AIR, BARRIER, ORE,
-    REGOLITH, VOXEL,
+    self, block_display_name, block_hp, raycast, VoxelWorld, AIR, BARRIER, ORE, REGOLITH, VOXEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -463,6 +462,14 @@ fn player_move(
 ) {
     let dt = time.delta_secs().min(0.05); // clamp tunneling on hitches
 
+    // Ride the rock: if a body is moving under (or around) the player, it
+    // carries them — standing on an asteroid while the hole drags it is THE
+    // fantasy this game runs on.
+    let carry = world.carrier_delta(player.pos);
+    if carry != Vec3::ZERO {
+        player.pos += carry;
+    }
+
     // Thrust wish vector. Grounded: flat walk axes for precise footwork.
     // Airborne: full 6DOF — W follows the look ray (pitch included).
     let mut wish = Vec3::ZERO;
@@ -766,12 +773,12 @@ fn mining(
     laser.has_hit = true;
     laser.beam_end = eye + dir * (hit.t - 0.01).max(0.1);
 
-    let (tier, species) = voxel_env(v);
+    let (tier, species) = world.env_of(v);
     let hp_max = block_hp(id, tier);
     let is_ore = id == ORE;
     let value = if is_ore { world::ore_value(tier) } else { 0 };
 
-    let mut remaining = *world.damage.get(&v).unwrap_or(&hp_max);
+    let mut remaining = world.damage_of(v).unwrap_or(hp_max);
     if laser.firing && id != BARRIER {
         let damage = upgrades.dps() * dt;
         remaining -= damage;
@@ -802,7 +809,7 @@ fn mining(
                 true,
             );
             world.set_air(v);
-            items::spawn_drop(&mut commands, &mut item_assets, &mut materials, v, id);
+            items::spawn_drop(&mut commands, &mut item_assets, &mut materials, v, id, tier);
             items::spawn_block_debris(&mut commands, &item_assets, v);
             items::spawn_sparks(&mut commands, &item_assets, laser.beam_end, 6, !is_ore, v.x);
             // Crystals ring, rock crunches — deeper rock lands heavier.
@@ -830,7 +837,7 @@ fn mining(
             *dmg_accum = 0.0;
             *pop_timer = 0.0;
         }
-        world.damage.insert(v, remaining);
+        world.set_damage(v, remaining);
     } else {
         *dmg_accum = 0.0;
         *pop_timer = 0.0;

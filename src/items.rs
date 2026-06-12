@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use crate::audio::{SfxEvent, SfxQueue};
 use crate::game::{Inventory, StatusMsg, Upgrades};
 use crate::player::{PlayerState, Shake};
-use crate::world::{loot_color, tier_of_voxel, VoxelWorld, AIR, BARRIER, VOXEL};
+use crate::world::{loot_color, VoxelWorld, AIR, BARRIER, VOXEL};
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -222,15 +222,17 @@ fn spawn_drop_at(
     ));
 }
 
-/// The mining-path drop: one unit pops out of a destroyed voxel.
+/// The mining-path drop: one unit pops out of a destroyed voxel. `tier`
+/// comes from the caller's body-aware lookup (bodies move now — a pure
+/// position lookup would miss a displaced rock).
 pub fn spawn_drop(
     commands: &mut Commands,
     assets: &mut ItemAssets,
     materials: &mut Assets<StandardMaterial>,
     v: IVec3,
     id: u8,
+    tier: i32,
 ) {
-    let tier = tier_of_voxel(v);
     let center = (v.as_vec3() + Vec3::splat(0.5)) * VOXEL;
     let a = scatter(v, 1) * std::f32::consts::TAU;
     // Gentle pop: in zero-G a fast drop coasts straight out of tractor range
@@ -521,7 +523,7 @@ fn explode(
     let c_vox = (center / VOXEL).floor().as_ivec3();
     // One blast = one asteroid (in practice): a single tier lookup covers
     // every carved voxel instead of 12k field queries.
-    let blast_tier = tier_of_voxel(c_vox);
+    let blast_tier = world.env_of(c_vox).0;
     let mut carved = 0usize;
     // Loot aggregation: (id, tier) -> voxels destroyed.
     let mut loot: HashMap<(u8, i32), u32> = HashMap::new();

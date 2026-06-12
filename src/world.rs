@@ -571,6 +571,76 @@ pub fn planet_list() -> std::sync::Arc<Vec<Asteroid>> {
     list
 }
 
+// ---------------------------------------------------------------------------
+// Bodies — every asteroid/planet is a rigid voxel BODY that the black hole
+// physically drags in. Terrain stays a pure function of "gen space" (the
+// body's original frame: storage, edits, meshes never change), and the body
+// carries a displacement toward the hole. World↔gen mapping is a voxel-
+// quantized offset, so all grid math (collision, raycast, mining) works
+// unchanged; meshes ride a per-body root transform (smooth). When a body's
+// true position crosses the horizon its chunks are despawned — consumed for
+// real, not as an effect.
+// ---------------------------------------------------------------------------
+
+/// Body identity: belt rocks use their field cell; the home rock is ZERO;
+/// planets use sentinel keys outside any reachable cell range.
+const PLANET_KEY_BASE: i32 = 1_000_000;
+
+pub fn planet_key(i: usize) -> IVec3 {
+    IVec3::new(PLANET_KEY_BASE + i as i32, 0, 0)
+}
+
+/// The asteroid for a body key (gen-space description).
+pub fn body_by_key(key: IVec3) -> Option<Asteroid> {
+    if key.x >= PLANET_KEY_BASE {
+        planet_list().get((key.x - PLANET_KEY_BASE) as usize).copied()
+    } else {
+        asteroid_in_cell(key)
+    }
+}
+
+/// All bodies whose GEN-SPACE surface could intersect the AABB, with keys.
+#[allow(dead_code)] // test helper API
+pub fn bodies_overlapping(min_m: Vec3, max_m: Vec3) -> Vec<(IVec3, Asteroid)> {
+    let pad = R_MAX * STRETCH_MAX * (0.95 + AMP_MAX) + 0.5;
+    let lo = cell_of(min_m - Vec3::splat(pad));
+    let hi = cell_of(max_m + Vec3::splat(pad));
+    let mut out = Vec::new();
+    for cz in lo.z..=hi.z {
+        for cy in lo.y..=hi.y {
+            for cx in lo.x..=hi.x {
+                let c = IVec3::new(cx, cy, cz);
+                if let Some(a) = asteroid_in_cell(c) {
+                    let closest = a.center.clamp(min_m, max_m);
+                    if closest.distance(a.center) <= a.reach() {
+                        out.push((c, a));
+                    }
+                }
+            }
+        }
+    }
+    for (i, p) in planet_list().iter().enumerate() {
+        let closest = p.center.clamp(min_m, max_m);
+        if closest.distance(p.center) <= p.reach() {
+            out.push((planet_key(i), *p));
+        }
+    }
+    out
+}
+
+/// A body's displacement state. `offset` is smooth (drives the mesh root);
+/// `off_vox` is the voxel-quantized version every collision/storage mapping
+/// uses; `delta` is how far the quantized position moved this frame (the
+/// player standing on the body is carried by exactly this).
+#[derive(Clone, Copy, Default)]
+pub struct BodyMotion {
+    pub offset: Vec3,
+    pub off_vox: IVec3,
+    pub delta: Vec3,
+    pub eaten: bool,
+    backfilled: bool,
+}
+
 /// The cell guaranteed to host a starter rock near home — the field is sparse
 /// now, so without this an unlucky day could strand a fresh claim. Direction
 /// varies with the world salt; always within 2 cells (~120m, tier 0/1).
@@ -664,28 +734,35 @@ pub fn asteroids_overlapping(min_m: Vec3, max_m: Vec3) -> Vec<Asteroid> {
     out
 }
 
-/// The nearest asteroid to `p` other than home — demo + future nav use.
-#[allow(dead_code)]
-pub fn nearest_asteroid(p: Vec3, exclude_home: bool) -> Option<Asteroid> {
+/// The nearest asteroid to `p` other than home (gen-space positions), with
+/// its body key — demo + future nav use.
+pub fn nearest_asteroid_keyed(p: Vec3, exclude_home: bool) -> Option<(IVec3, Asteroid)> {
     let pc = cell_of(p);
-    let mut best: Option<(f32, Asteroid)> = None;
+    let mut best: Option<(f32, IVec3, Asteroid)> = None;
     for cz in -2..=2 {
         for cy in -2..=2 {
             for cx in -2..=2 {
-                let Some(a) = asteroid_in_cell(pc + IVec3::new(cx, cy, cz)) else {
+                let c = pc + IVec3::new(cx, cy, cz);
+                let Some(a) = asteroid_in_cell(c) else {
                     continue;
                 };
                 if exclude_home && a.center == Vec3::ZERO {
                     continue;
                 }
                 let d = p.distance(a.center) - a.reach();
-                if best.is_none_or(|(bd, _)| d < bd) {
-                    best = Some((d, a));
+                if best.is_none_or(|(bd, _, _)| d < bd) {
+                    best = Some((d, c, a));
                 }
             }
         }
     }
-    best.map(|(_, a)| a)
+    best.map(|(_, c, a)| (c, a))
+}
+
+/// The nearest asteroid to `p` other than home — gen-space convenience.
+#[allow(dead_code)]
+pub fn nearest_asteroid(p: Vec3, exclude_home: bool) -> Option<Asteroid> {
+    nearest_asteroid_keyed(p, exclude_home).map(|(_, a)| a)
 }
 
 #[inline]
@@ -710,6 +787,7 @@ pub fn block_at(v: IVec3) -> u8 {
 
 /// (tier, species) of the asteroid covering this voxel — distance tier and
 /// default species in open space.
+#[allow(dead_code)] // pure-gen variant kept for tests
 pub fn voxel_env(v: IVec3) -> (i32, u8) {
     let p = voxel_center_m(v);
     asteroids_overlapping(p, p)
@@ -722,6 +800,7 @@ pub fn voxel_env(v: IVec3) -> (i32, u8) {
 }
 
 /// Tier of the asteroid covering this voxel (distance tier in open space).
+#[allow(dead_code)] // pure-gen variant kept for tests
 pub fn tier_of_voxel(v: IVec3) -> i32 {
     voxel_env(v).0
 }
@@ -846,35 +925,153 @@ fn chunk_bounds_m(cp: IVec3) -> (Vec3, Vec3) {
     (min, min + Vec3::splat(CHUNK_M))
 }
 
+/// A body within collision/interaction range of the player, with the
+/// precomputed world↔gen mapping. Refreshed once per frame.
+#[derive(Clone, Copy)]
+pub struct NearBody {
+    pub key: IVec3,
+    pub a: Asteroid,
+    /// Quantized offset, voxels and meters (always VOXEL-aligned).
+    pub off_vox: IVec3,
+    pub off_m: Vec3,
+    /// Gen-space voxel bounding box for cheap rejection.
+    vmin: IVec3,
+    vmax: IVec3,
+}
+
+impl NearBody {
+    fn new(key: IVec3, a: Asteroid, off_vox: IVec3) -> Self {
+        let r = a.reach() + VOXEL;
+        let vmin = ((a.center - Vec3::splat(r)) / VOXEL).floor().as_ivec3();
+        let vmax = ((a.center + Vec3::splat(r)) / VOXEL).ceil().as_ivec3();
+        Self {
+            key,
+            a,
+            off_vox,
+            off_m: off_vox.as_vec3() * VOXEL,
+            vmin,
+            vmax,
+        }
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct VoxelWorld {
-    chunks: HashMap<IVec3, Chunk>,
-    /// Chunks known to intersect no asteroid: tracked, but no storage/entities.
-    empty: HashSet<IVec3>,
+    /// Per-body chunk storage in GEN space, keyed (body, chunk).
+    chunks: HashMap<(IVec3, IVec3), Chunk>,
+    /// (body, chunk) pairs known to hold none of that body's blocks.
+    empty: HashSet<(IVec3, IVec3)>,
     /// Chunks whose mesh is stale and needs a rebuild.
-    pub dirty: HashSet<IVec3>,
-    /// Remaining HP of partially-mined blocks. Sparse: only blocks under attack.
-    pub damage: HashMap<IVec3, f32>,
-    /// Player edits (mined voxels), forever. Survives chunk unload; applied on
-    /// regeneration. This is also exactly what a save file would serialize.
+    pub dirty: HashSet<(IVec3, IVec3)>,
+    /// Remaining HP of partially-mined blocks, keyed by GEN-space voxel
+    /// (bodies are disjoint in gen space, so no body key needed).
+    damage: HashMap<IVec3, f32>,
+    /// Player edits (mined voxels) in GEN space, forever. Survives unload
+    /// AND body movement; applied on regeneration.
     edits: HashMap<IVec3, u8>,
+    /// Displacement state per body key. Home (ZERO) never moves.
+    motion: HashMap<IVec3, BodyMotion>,
+    /// Bodies within interaction range, with mappings. Refreshed per frame.
+    nearby: Vec<NearBody>,
 }
 
 impl VoxelWorld {
-    /// Block id at a voxel. Falls back to pure worldgen (+ edits) for chunks
-    /// that aren't materialized, so collision/raycasts are correct anywhere.
-    pub fn block(&self, v: IVec3) -> u8 {
-        let cp = chunk_of(v);
-        if let Some(c) = self.chunks.get(&cp) {
-            return c.blocks[local_index(v)];
+    /// Rebuild the nearby-body list around `center`. Candidates: gen cells in
+    /// range (un-moved bodies), every tracked moving body, home, and planets.
+    pub fn refresh_nearby(&mut self, center: Vec3, radius: f32) {
+        self.nearby.clear();
+        let r2 = |a: &Asteroid, off: Vec3| {
+            let d = a.center + off - center;
+            d.length() < radius + a.reach()
+        };
+        // Tracked bodies (have motion entries — possibly far from gen cell).
+        for (key, m) in &self.motion {
+            if m.eaten {
+                continue;
+            }
+            if let Some(a) = body_by_key(*key) {
+                if r2(&a, m.offset) {
+                    self.nearby.push(NearBody::new(*key, a, m.off_vox));
+                }
+            }
         }
-        if self.empty.contains(&cp) {
+        // Un-tracked belt cells in gen range (offset zero by definition).
+        let lo = cell_of(center - Vec3::splat(radius + CELL_M));
+        let hi = cell_of(center + Vec3::splat(radius + CELL_M));
+        for cz in lo.z..=hi.z {
+            for cy in lo.y..=hi.y {
+                for cx in lo.x..=hi.x {
+                    let c = IVec3::new(cx, cy, cz);
+                    if self.motion.contains_key(&c) {
+                        continue; // already added (or eaten)
+                    }
+                    if let Some(a) = asteroid_in_cell(c) {
+                        if r2(&a, Vec3::ZERO) {
+                            self.nearby.push(NearBody::new(c, a, IVec3::ZERO));
+                        }
+                    }
+                }
+            }
+        }
+        // Planets not yet tracked (early frames).
+        for (i, p) in planet_list().iter().enumerate() {
+            let key = planet_key(i);
+            if !self.motion.contains_key(&key) && r2(p, Vec3::ZERO) {
+                self.nearby.push(NearBody::new(key, *p, IVec3::ZERO));
+            }
+        }
+    }
+
+    pub fn nearby(&self) -> &[NearBody] {
+        &self.nearby
+    }
+
+    /// Resolve a WORLD voxel to (body, gen voxel), if any nearby body covers it.
+    #[inline]
+    fn resolve(&self, v: IVec3) -> Option<(&NearBody, IVec3)> {
+        for nb in &self.nearby {
+            let g = v - nb.off_vox;
+            if g.cmplt(nb.vmin).any() || g.cmpgt(nb.vmax).any() {
+                continue;
+            }
+            return Some((nb, g));
+        }
+        None
+    }
+
+    /// Block id at a WORLD voxel: maps through each nearby body's offset,
+    /// then storage → edits → pure single-body gen.
+    pub fn block(&self, v: IVec3) -> u8 {
+        for nb in &self.nearby {
+            let g = v - nb.off_vox;
+            if g.cmplt(nb.vmin).any() || g.cmpgt(nb.vmax).any() {
+                continue;
+            }
+            let b = self.block_gen(nb.key, &nb.a, g);
+            if b != AIR {
+                return b;
+            }
+        }
+        AIR
+    }
+
+    /// Block id in one body's GEN space (storage / edits / pure gen).
+    fn block_gen(&self, key: IVec3, a: &Asteroid, g: IVec3) -> u8 {
+        let cp = chunk_of(g);
+        if let Some(c) = self.chunks.get(&(key, cp)) {
+            return c.blocks[local_index(g)];
+        }
+        if self.empty.contains(&(key, cp)) {
             return AIR;
         }
-        if let Some(&b) = self.edits.get(&v) {
+        if let Some(&b) = self.edits.get(&g) {
             return b;
         }
-        block_at(v)
+        let p = voxel_center_m(g);
+        if p.distance_squared(a.center) > a.reach() * a.reach() {
+            return AIR;
+        }
+        classify(a, g, p, field_single(a, p)).unwrap_or(AIR)
     }
 
     #[inline]
@@ -882,27 +1079,70 @@ impl VoxelWorld {
         self.block(v) != AIR
     }
 
-    pub fn is_loaded(&self, cp: IVec3) -> bool {
-        self.chunks.contains_key(&cp) || self.empty.contains(&cp)
+    /// (tier, species) governing a WORLD voxel.
+    pub fn env_of(&self, v: IVec3) -> (i32, u8) {
+        match self.resolve(v) {
+            Some((nb, _)) => (nb.a.tier, nb.a.species),
+            None => (((v.as_vec3() * VOXEL).length() / TIER_M) as i32, 0),
+        }
     }
 
-    /// Generate (or regenerate) a chunk. Returns false if it's pure vacuum.
-    pub fn generate_chunk(&mut self, cp: IVec3) -> bool {
+    /// Remaining-HP accessors for a WORLD voxel (stored in gen space).
+    pub fn damage_of(&self, v: IVec3) -> Option<f32> {
+        let (_, g) = self.resolve(v)?;
+        self.damage.get(&g).copied()
+    }
+    pub fn set_damage(&mut self, v: IVec3, hp: f32) {
+        if let Some((_, g)) = self.resolve(v) {
+            self.damage.insert(g, hp);
+        }
+    }
+
+    /// The smooth visual offset of a body (ZERO if untracked).
+    pub fn offset_of(&self, key: IVec3) -> Vec3 {
+        self.motion.get(&key).map_or(Vec3::ZERO, |m| m.offset)
+    }
+    pub fn is_eaten(&self, key: IVec3) -> bool {
+        self.motion.get(&key).is_some_and(|m| m.eaten)
+    }
+    #[allow(dead_code)] // test access
+    pub fn motion_mut(&mut self) -> &mut HashMap<IVec3, BodyMotion> {
+        &mut self.motion
+    }
+
+    /// How far the body under the player's feet moved this frame — applied
+    /// to the player so a falling rock carries its passenger. Also answers
+    /// for a player EMBEDDED in a body (walls moved into them).
+    pub fn carrier_delta(&self, feet: Vec3) -> Vec3 {
+        for probe in [
+            feet + Vec3::new(0.0, -0.05, 0.0),
+            feet,
+            feet + Vec3::new(0.0, 0.7, 0.0),
+        ] {
+            let v = (probe / VOXEL).floor().as_ivec3();
+            if let Some((nb, g)) = self.resolve(v) {
+                if self.block_gen(nb.key, &nb.a, g) != AIR {
+                    return self.motion.get(&nb.key).map_or(Vec3::ZERO, |m| m.delta);
+                }
+            }
+        }
+        Vec3::ZERO
+    }
+
+    pub fn is_loaded(&self, key: IVec3, cp: IVec3) -> bool {
+        self.chunks.contains_key(&(key, cp)) || self.empty.contains(&(key, cp))
+    }
+
+    /// Generate (or regenerate) one body's chunk in gen space. Returns false
+    /// if it holds none of that body's blocks.
+    pub fn generate_chunk(&mut self, key: IVec3, a: &Asteroid, cp: IVec3) -> bool {
         let (min_m, max_m) = chunk_bounds_m(cp);
-        let asteroids = asteroids_overlapping(min_m, max_m);
-        if asteroids.is_empty() {
-            self.empty.insert(cp);
+        let closest = a.center.clamp(min_m, max_m);
+        if closest.distance(a.center) > a.reach() {
+            self.empty.insert((key, cp));
             return false;
         }
-        // One coarse field grid per overlapping asteroid; per-voxel work is
-        // then a distance check + trilerp, not an fbm evaluation.
-        let grids: Vec<(Asteroid, FieldGrid)> = asteroids
-            .into_iter()
-            .map(|a| {
-                let g = FieldGrid::for_box(&a, min_m, max_m);
-                (a, g)
-            })
-            .collect();
+        let grid = FieldGrid::for_box(a, min_m, max_m);
         let mut blocks = Box::new([0u8; CHUNK_VOL]);
         let origin = cp * CHUNK;
         let mut any_solid = false;
@@ -914,17 +1154,11 @@ impl VoxelWorld {
                         Some(&e) => e,
                         None => {
                             let p = voxel_center_m(v);
-                            let mut b = AIR;
-                            for (a, grid) in &grids {
-                                if p.distance_squared(a.center) > a.reach() * a.reach() {
-                                    continue;
-                                }
-                                if let Some(id) = classify(a, v, p, grid.sample(p)) {
-                                    b = id;
-                                    break;
-                                }
+                            if p.distance_squared(a.center) > a.reach() * a.reach() {
+                                AIR
+                            } else {
+                                classify(a, v, p, grid.sample(p)).unwrap_or(AIR)
                             }
-                            b
                         }
                     };
                     any_solid |= b != AIR;
@@ -933,27 +1167,38 @@ impl VoxelWorld {
             }
         }
         if !any_solid {
-            self.empty.insert(cp);
+            self.empty.insert((key, cp));
             return false;
         }
-        self.chunks.insert(cp, Chunk { blocks });
-        self.dirty.insert(cp);
+        self.chunks.insert((key, cp), Chunk { blocks });
+        self.dirty.insert((key, cp));
         true
     }
 
-    pub fn unload_chunk(&mut self, cp: IVec3) {
-        self.chunks.remove(&cp);
-        self.dirty.remove(&cp);
+    pub fn unload_chunk(&mut self, key: IVec3, cp: IVec3) {
+        self.chunks.remove(&(key, cp));
+        self.dirty.remove(&(key, cp));
+    }
+
+    /// Drop ALL storage for a consumed body. Edits are kept (harmless — gen
+    /// space is never re-queried for an eaten body this day).
+    pub fn consume_body(&mut self, key: IVec3) {
+        self.chunks.retain(|(k, _), _| *k != key);
+        self.empty.retain(|(k, _)| *k != key);
+        self.dirty.retain(|(k, _)| *k != key);
+        if let Some(m) = self.motion.get_mut(&key) {
+            m.eaten = true;
+        }
     }
 
     pub fn forget_empty(&mut self, keep_near: IVec3, radius: i32) {
         self.empty
-            .retain(|cp| (*cp - keep_near).abs().max_element() <= radius);
+            .retain(|(_, cp)| (*cp - keep_near).abs().max_element() <= radius * 3);
     }
 
-    /// Day reset: drop ALL storage, edits, and damage, and reseed worldgen.
-    /// Chunks restream around the player on the following frames; the home
-    /// rock regenerates pristine.
+    /// Day reset: drop ALL storage, edits, damage, and motion, and reseed
+    /// worldgen. Chunks restream around the player on the following frames;
+    /// the home rock regenerates pristine.
     pub fn reset_for_new_day(&mut self, salt: u64) {
         set_world_salt(salt);
         self.chunks.clear();
@@ -961,20 +1206,26 @@ impl VoxelWorld {
         self.dirty.clear();
         self.damage.clear();
         self.edits.clear();
+        self.motion.clear();
+        self.nearby.clear();
     }
 
-    /// Remove a block (mined out). Records the edit and marks the chunk — and
-    /// any face-adjacent neighbor chunks — dirty so culled faces get rebuilt.
+    /// Remove a block at a WORLD voxel (mined out). Records the gen-space
+    /// edit and marks the owning chunk — and face-adjacent neighbors — dirty.
     pub fn set_air(&mut self, v: IVec3) {
-        self.edits.insert(v, AIR);
-        let cp = chunk_of(v);
-        if let Some(c) = self.chunks.get_mut(&cp) {
-            c.blocks[local_index(v)] = AIR;
+        let Some((nb, g)) = self.resolve(v) else { return };
+        let key = nb.key;
+        let a = nb.a;
+        self.edits.insert(g, AIR);
+        let cp = chunk_of(g);
+        if let Some(c) = self.chunks.get_mut(&(key, cp)) {
+            c.blocks[local_index(g)] = AIR;
         }
-        self.damage.remove(&v);
-        if self.chunks.contains_key(&cp) {
-            self.dirty.insert(cp);
+        self.damage.remove(&g);
+        if self.chunks.contains_key(&(key, cp)) {
+            self.dirty.insert((key, cp));
         }
+        let _ = a;
         for d in [
             IVec3::X,
             IVec3::NEG_X,
@@ -983,9 +1234,9 @@ impl VoxelWorld {
             IVec3::Z,
             IVec3::NEG_Z,
         ] {
-            let ncp = chunk_of(v + d);
-            if ncp != cp && self.chunks.contains_key(&ncp) {
-                self.dirty.insert(ncp);
+            let ncp = chunk_of(g + d);
+            if ncp != cp && self.chunks.contains_key(&(key, ncp)) {
+                self.dirty.insert((key, ncp));
             }
         }
     }
@@ -1004,7 +1255,38 @@ pub struct RayHit {
     pub t: f32,
 }
 
+/// Cast against every nearby body (each in its own gen frame, shifted by its
+/// quantized offset) and keep the nearest hit. Hit voxel/normal are WORLD.
 pub fn raycast(world: &VoxelWorld, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RayHit> {
+    let mut best: Option<RayHit> = None;
+    for nb in world.nearby() {
+        // Cheap rejection: ray vs the body's current bounding sphere.
+        let center = nb.a.center + nb.off_m;
+        let to = center - origin;
+        let along = to.dot(dir.normalize_or_zero());
+        let closest2 = to.length_squared() - along * along;
+        let r = nb.a.reach() + 1.0;
+        if closest2 > r * r || (along < -r) || (along - r > max_dist) {
+            continue;
+        }
+        if let Some(mut hit) = raycast_one(world, nb, origin - nb.off_m, dir, max_dist) {
+            hit.voxel += nb.off_vox;
+            if best.as_ref().is_none_or(|b| hit.t < b.t) {
+                best = Some(hit);
+            }
+        }
+    }
+    best
+}
+
+/// DDA through one body's gen-space grid.
+fn raycast_one(
+    world: &VoxelWorld,
+    nb: &NearBody,
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+) -> Option<RayHit> {
     let dir = dir.normalize_or_zero();
     if dir == Vec3::ZERO {
         return None;
@@ -1033,7 +1315,10 @@ pub fn raycast(world: &VoxelWorld, origin: Vec3, dir: Vec3, max_dist: f32) -> Op
     let mut normal = IVec3::ZERO;
     let mut t = 0.0f32;
     while t <= max_t {
-        if world.solid(cell) {
+        if cell.cmpge(nb.vmin).all()
+            && cell.cmple(nb.vmax).all()
+            && world.block_gen(nb.key, &nb.a, cell) != AIR
+        {
             return Some(RayHit {
                 voxel: cell,
                 normal,
@@ -1166,27 +1451,19 @@ impl MeshScratch {
     }
 }
 
-/// Build both meshes for a chunk: (lit rock mesh, unlit HDR crystal-glow mesh).
-pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
+/// Build both meshes for one BODY's chunk in gen space: (lit rock mesh,
+/// unlit HDR crystal-glow mesh). Verts are gen-space; the body root's
+/// transform carries them to the body's current position.
+pub fn mesh_chunk(world: &VoxelWorld, key: IVec3, a: &Asteroid, cp: IVec3) -> (Mesh, Mesh) {
     // Event-driven (not per-frame-hot): a few transient Vecs per remesh is fine.
     let mut solid = MeshScratch::new();
     let mut glow = MeshScratch::new();
 
-    // One asteroid lookup + coarse field grid per chunk, shared by every
-    // voxel: tier/shell per voxel is a trilerp, not an fbm evaluation.
+    // One coarse field grid for this body; tier/shell per voxel is a trilerp.
     let (min_m, max_m) = chunk_bounds_m(cp);
-    let grids: Vec<(Asteroid, FieldGrid)> = asteroids_overlapping(min_m, max_m)
-        .into_iter()
-        .map(|a| {
-            let g = FieldGrid::for_box(&a, min_m, max_m);
-            (a, g)
-        })
-        .collect();
+    let grid = FieldGrid::for_box(a, min_m, max_m);
     let tier_at = |p: Vec3| -> (i32, u8, bool, bool) {
-        for (a, grid) in &grids {
-            if p.distance_squared(a.center) > a.reach() * a.reach() {
-                continue;
-            }
+        if p.distance_squared(a.center) <= a.reach() * a.reach() {
             let f = grid.sample(p);
             if f > 0.0 {
                 return (a.tier, a.species, a.is_planet, f < SHELL_M);
@@ -1200,7 +1477,7 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
         for z in 0..CHUNK {
             for x in 0..CHUNK {
                 let v = origin + IVec3::new(x, y, z);
-                let id = world.block(v);
+                let id = world.block_gen(key, a, v);
                 if id == AIR {
                     continue;
                 }
@@ -1208,7 +1485,7 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
                 let col = block_color(id, tier, species, planet, v, shell);
                 let base = (v.as_vec3()) * VOXEL;
                 for face in &FACES {
-                    if world.solid(v + face.dir) {
+                    if world.block_gen(key, a, v + face.dir) != AIR {
                         continue;
                     }
                     if id == ORE {
@@ -1237,20 +1514,44 @@ pub fn mesh_chunk(world: &VoxelWorld, cp: IVec3) -> (Mesh, Mesh) {
 // Systems — chunk lifecycle
 // ---------------------------------------------------------------------------
 
-/// Solid + glow mesh entities for each materialized chunk.
+/// Solid + glow mesh entities for each materialized (body, chunk), plus one
+/// root entity per body — chunk meshes are its children, and moving the body
+/// is just moving the root's transform.
 #[derive(Resource, Default)]
-pub struct ChunkEntities(HashMap<IVec3, (Entity, Entity)>);
+pub struct ChunkEntities {
+    map: HashMap<(IVec3, IVec3), (Entity, Entity)>,
+    roots: HashMap<IVec3, Entity>,
+}
 
 impl ChunkEntities {
-    /// Day reset: despawn every chunk mesh entity. Pairs with
-    /// `VoxelWorld::reset_for_new_day`.
-    pub fn despawn_all(&mut self, commands: &mut Commands) {
-        for (_, (a, b)) in self.0.drain() {
-            commands.entity(a).despawn();
-            commands.entity(b).despawn();
+    fn root(&mut self, key: IVec3, commands: &mut Commands) -> Entity {
+        *self.roots.entry(key).or_insert_with(|| {
+            commands
+                .spawn((Transform::IDENTITY, Visibility::Visible, BodyRoot(key)))
+                .id()
+        })
+    }
+
+    /// Despawn one body's root (children — all its chunk meshes — included).
+    pub fn despawn_body(&mut self, key: IVec3, commands: &mut Commands) {
+        if let Some(root) = self.roots.remove(&key) {
+            commands.entity(root).despawn();
         }
+        self.map.retain(|(k, _), _| *k != key);
+    }
+
+    /// Day reset: despawn every body root (and with them all chunk meshes).
+    pub fn despawn_all(&mut self, commands: &mut Commands) {
+        for (_, root) in self.roots.drain() {
+            commands.entity(root).despawn();
+        }
+        self.map.clear();
     }
 }
+
+/// Marks a body's mesh root; the wrapped key indexes BodyMotion.
+#[derive(Component)]
+pub struct BodyRoot(pub IVec3);
 
 #[derive(Resource)]
 pub struct WorldAssets {
@@ -1293,8 +1594,156 @@ impl Plugin for WorldPlugin {
             .add_systems(Startup, setup_world_assets)
             .add_systems(
                 Update,
-                (ensure_chunks, remesh_dirty, unload_far_chunks).chain(),
+                (
+                    body_motion,
+                    refresh_nearby_system,
+                    ensure_chunks,
+                    remesh_dirty,
+                    unload_far_chunks,
+                    sync_body_roots,
+                )
+                    .chain()
+                    .before(crate::GameplaySet),
             );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Body motion — the hole REALLY drags the field in
+// ---------------------------------------------------------------------------
+
+/// Tracking radius around the player: every body that can be seen as an
+/// impostor gets real motion state (and a backfilled offset on first sight).
+const TRACK_RADIUS_M: f32 = 950.0;
+/// Kinematic infall: terminal velocity ~ pull * TAU, dead below the
+/// threshold so the dawn field is still, capped so collision stays sane.
+const INFALL_TAU: f32 = 7.0;
+const INFALL_MIN_PULL: f32 = 0.22;
+const INFALL_MAX_V: f32 = 90.0;
+/// Backfill integration step (s) when a body is first tracked mid-day.
+const BACKFILL_STEP: f32 = 2.0;
+
+fn infall_speed(pull: f32) -> f32 {
+    ((pull - INFALL_MIN_PULL).max(0.0) * INFALL_TAU).min(INFALL_MAX_V)
+}
+
+/// Advance every tracked body toward the hole; consume bodies the horizon
+/// reaches (their REAL chunks despawn); register newly-visible bodies with a
+/// deterministic backfilled displacement.
+#[allow(clippy::too_many_arguments)]
+fn body_motion(
+    time: Res<Time>,
+    day: Res<crate::blackhole::DayState>,
+    bh: Res<crate::blackhole::BlackHole>,
+    player: Res<crate::player::PlayerState>,
+    mut world: ResMut<VoxelWorld>,
+    mut chunk_entities: ResMut<ChunkEntities>,
+    eat_fx: Option<Res<crate::blackhole::EatFx>>,
+    mut sfx: ResMut<crate::audio::SfxQueue>,
+    mut commands: Commands,
+    mut scan_tick: Local<u32>,
+) {
+    let dt = time.delta_secs().min(0.05);
+
+    // Periodic discovery sweep: register bodies entering tracking range.
+    // Planets and home register on the first pass regardless of distance.
+    *scan_tick = scan_tick.wrapping_add(1);
+    if *scan_tick % 31 == 1 {
+        let register = |key: IVec3, a: &Asteroid, world: &mut VoxelWorld| {
+            if world.motion.contains_key(&key) {
+                return;
+            }
+            let mut m = BodyMotion::default();
+            if key != IVec3::ZERO {
+                // Backfill: integrate the infall this body already suffered
+                // since dawn, from the analytic hole history. Deterministic,
+                // so a rock looks the same whenever you first see it.
+                let mut t = 0.0;
+                let mut center = a.center;
+                while t < day.elapsed {
+                    let step = BACKFILL_STEP.min(day.elapsed - t);
+                    let (hc, gm) = crate::blackhole::hole_kinematics(t, day.day_len);
+                    let to = hc - center;
+                    let d2 = to.length_squared().max(10_000.0);
+                    let pull = (gm / d2).min(65.0);
+                    let v = infall_speed(pull);
+                    center += to.normalize_or_zero() * v * step;
+                    t += step;
+                }
+                m.offset = center - a.center;
+                m.off_vox = (m.offset / VOXEL).round().as_ivec3();
+            }
+            m.backfilled = true;
+            world.motion.insert(key, m);
+        };
+        let pc = cell_of(player.pos);
+        let r_cells = (TRACK_RADIUS_M / CELL_M).ceil() as i32;
+        for cz in -r_cells..=r_cells {
+            for cy in -r_cells..=r_cells {
+                for cx in -r_cells..=r_cells {
+                    let c = pc + IVec3::new(cx, cy, cz);
+                    if world.motion.contains_key(&c) {
+                        continue;
+                    }
+                    let Some(a) = asteroid_in_cell(c) else { continue };
+                    if (a.center - player.pos).length() < TRACK_RADIUS_M + a.reach() {
+                        register(c, &a, &mut world);
+                    }
+                }
+            }
+        }
+        for (i, p) in planet_list().iter().enumerate() {
+            register(planet_key(i), p, &mut world);
+        }
+        register(IVec3::ZERO, &asteroid_in_cell(IVec3::ZERO).unwrap(), &mut world);
+    }
+
+    // Advance the living; feed the horizon.
+    let mut consumed: Vec<(IVec3, Vec3)> = Vec::new();
+    for (key, m) in world.motion.iter_mut() {
+        if m.eaten || *key == IVec3::ZERO {
+            m.delta = Vec3::ZERO;
+            continue;
+        }
+        let Some(a) = body_by_key(*key) else { continue };
+        let center = a.center + m.offset;
+        let pull = bh.pull(center).length();
+        let to = (bh.center - center).normalize_or_zero();
+        m.offset += to * infall_speed(pull) * dt;
+        let new_q = (m.offset / VOXEL).round().as_ivec3();
+        m.delta = (new_q - m.off_vox).as_vec3() * VOXEL;
+        m.off_vox = new_q;
+        if (a.center + m.offset).distance(bh.center) < bh.horizon_r {
+            consumed.push((*key, a.center + m.offset));
+        }
+    }
+    for (key, where_) in consumed {
+        // Rare event; this log line is the proof that REAL terrain went in.
+        info!("hole consumed body {key} at {where_}");
+        world.consume_body(key);
+        chunk_entities.despawn_body(key, &mut commands);
+        if let Some(fx) = &eat_fx {
+            crate::blackhole::spawn_eat_streaks(&mut commands, fx, where_, bh.center);
+        }
+        // A world dying is loud; a pebble is not.
+        if key.x >= PLANET_KEY_BASE {
+            sfx.push(crate::audio::SfxEvent::Explosion);
+        }
+    }
+}
+
+fn refresh_nearby_system(
+    player: Res<crate::player::PlayerState>,
+    mut world: ResMut<VoxelWorld>,
+) {
+    // Covers collision, mining reach, enclosure probes, drops, and charges.
+    world.refresh_nearby(player.pos, 140.0);
+}
+
+/// Slide each body's mesh root to its smooth offset.
+fn sync_body_roots(world: Res<VoxelWorld>, mut roots: Query<(&BodyRoot, &mut Transform)>) {
+    for (root, mut tf) in &mut roots {
+        tf.translation = world.offset_of(root.0);
     }
 }
 
@@ -1315,8 +1764,10 @@ fn setup_world_assets(mut commands: Commands, mut materials: ResMut<Assets<Stand
     });
 }
 
-/// Materialize chunks around the player, nearest first, within a per-frame
-/// budget. Pure-vacuum chunks cost a set entry, not storage or entities.
+/// Materialize chunks around the player, nearest first, within a shared
+/// per-frame budget — PER BODY, in each body's gen frame (the player's gen
+/// position differs per body by its offset). Pure-vacuum chunks cost a set
+/// entry, not storage or entities.
 fn ensure_chunks(
     player: Res<crate::player::PlayerState>,
     order: Res<GenOrder>,
@@ -1326,38 +1777,63 @@ fn ensure_chunks(
     assets: Res<WorldAssets>,
     mut commands: Commands,
 ) {
-    let pc = chunk_of((player.pos / VOXEL).floor().as_ivec3());
     let mut budget = GEN_BUDGET;
-    for off in &order.0 {
+    let stream_reach = GEN_RADIUS as f32 * CHUNK_M;
+    let bodies: Vec<NearBody> = world
+        .nearby()
+        .iter()
+        .filter(|nb| {
+            (nb.a.center + nb.off_m - player.pos).length() < nb.a.reach() + stream_reach
+        })
+        .copied()
+        .collect();
+    for nb in bodies {
         if budget == 0 {
             break;
         }
-        let cp = pc + *off;
-        if world.is_loaded(cp) {
-            continue;
+        // The player's position in this body's gen frame.
+        let player_gen = player.pos - nb.off_m;
+        let pc = chunk_of((player_gen / VOXEL).floor().as_ivec3());
+        // Body's chunk-space bounding box for cheap rejection.
+        let cmin = chunk_of(nb.vmin);
+        let cmax = chunk_of(nb.vmax);
+        let root = chunk_entities.root(nb.key, &mut commands);
+        for off in &order.0 {
+            if budget == 0 {
+                break;
+            }
+            let cp = pc + *off;
+            if cp.cmplt(cmin).any() || cp.cmpgt(cmax).any() {
+                continue;
+            }
+            if world.is_loaded(nb.key, cp) {
+                continue;
+            }
+            budget -= 1;
+            if !world.generate_chunk(nb.key, &nb.a, cp) {
+                continue; // vacuum
+            }
+            let mut spawn_mesh = |material: &Handle<StandardMaterial>| {
+                let handle = meshes.add(Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
+                ));
+                let e = commands
+                    .spawn((
+                        Mesh3d(handle),
+                        MeshMaterial3d(material.clone()),
+                        Transform::IDENTITY,
+                        Visibility::Hidden,
+                        ChunkMesh,
+                    ))
+                    .id();
+                commands.entity(root).add_child(e);
+                e
+            };
+            let solid = spawn_mesh(&assets.material);
+            let glow = spawn_mesh(&assets.glow_material);
+            chunk_entities.map.insert((nb.key, cp), (solid, glow));
         }
-        budget -= 1;
-        if !world.generate_chunk(cp) {
-            continue; // vacuum
-        }
-        let mut spawn_mesh = |material: &Handle<StandardMaterial>| {
-            let handle = meshes.add(Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            ));
-            commands
-                .spawn((
-                    Mesh3d(handle),
-                    MeshMaterial3d(material.clone()),
-                    Transform::IDENTITY,
-                    Visibility::Hidden,
-                    ChunkMesh,
-                ))
-                .id()
-        };
-        let solid = spawn_mesh(&assets.material);
-        let glow = spawn_mesh(&assets.glow_material);
-        chunk_entities.0.insert(cp, (solid, glow));
     }
 }
 
@@ -1370,13 +1846,14 @@ fn remesh_dirty(
     if world.dirty.is_empty() {
         return;
     }
-    let batch: Vec<IVec3> = world.dirty.iter().copied().take(REMESH_BUDGET).collect();
-    for cp in batch {
-        world.dirty.remove(&cp);
-        let Some(&(solid_e, glow_e)) = chunk_entities.0.get(&cp) else {
+    let batch: Vec<(IVec3, IVec3)> = world.dirty.iter().copied().take(REMESH_BUDGET).collect();
+    for (key, cp) in batch {
+        world.dirty.remove(&(key, cp));
+        let Some(&(solid_e, glow_e)) = chunk_entities.map.get(&(key, cp)) else {
             continue;
         };
-        let (solid_mesh, glow_mesh) = mesh_chunk(&world, cp);
+        let Some(a) = body_by_key(key) else { continue };
+        let (solid_mesh, glow_mesh) = mesh_chunk(&world, key, &a, cp);
         for (entity, mesh) in [(solid_e, solid_mesh), (glow_e, glow_mesh)] {
             let empty = mesh.count_vertices() == 0;
             if let Ok((mesh3d, mut vis)) = chunks.get_mut(entity) {
@@ -1393,8 +1870,9 @@ fn remesh_dirty(
     }
 }
 
-/// Drop chunk storage + mesh entities far behind the player. Edits persist in
-/// the overlay, so flying back regenerates the world exactly as you left it.
+/// Drop chunk storage + mesh entities far behind the player (measured at the
+/// body's CURRENT position). Edits persist in the gen-space overlay, so
+/// flying back regenerates everything exactly as you left it.
 fn unload_far_chunks(
     player: Res<crate::player::PlayerState>,
     mut world: ResMut<VoxelWorld>,
@@ -1406,20 +1884,26 @@ fn unload_far_chunks(
     if *tick % 97 != 0 {
         return; // sweep occasionally, not every frame
     }
-    let pc = chunk_of((player.pos / VOXEL).floor().as_ivec3());
-    let far: Vec<IVec3> = chunk_entities
-        .0
+    let far: Vec<(IVec3, IVec3)> = chunk_entities
+        .map
         .keys()
-        .filter(|cp| (**cp - pc).abs().max_element() > UNLOAD_RADIUS)
+        .filter(|(key, cp)| {
+            let off = world.offset_of(*key);
+            let world_center =
+                (cp.as_vec3() + Vec3::splat(0.5)) * CHUNK_M + off;
+            (world_center - player.pos).length()
+                > (UNLOAD_RADIUS as f32 + 1.0) * CHUNK_M
+        })
         .copied()
         .collect();
-    for cp in far {
-        if let Some((a, b)) = chunk_entities.0.remove(&cp) {
+    for (key, cp) in far {
+        if let Some((a, b)) = chunk_entities.map.remove(&(key, cp)) {
             commands.entity(a).despawn();
             commands.entity(b).despawn();
         }
-        world.unload_chunk(cp);
+        world.unload_chunk(key, cp);
     }
+    let pc = chunk_of((player.pos / VOXEL).floor().as_ivec3());
     world.forget_empty(pc, UNLOAD_RADIUS + 8);
 }
 
@@ -1427,17 +1911,23 @@ fn unload_far_chunks(
 mod tests {
     use super::*;
 
-    /// Materialize every chunk within `r_m` meters of a point.
+    /// Materialize every body's chunks within `r_m` meters of a point, and
+    /// refresh the nearby list so world-space queries resolve.
     fn gen_sphere(w: &mut VoxelWorld, center: Vec3, r_m: f32) {
         let r_c = (r_m / CHUNK_M).ceil() as i32;
         let cc = chunk_of((center / VOXEL).floor().as_ivec3());
         for z in -r_c..=r_c {
             for y in -r_c..=r_c {
                 for x in -r_c..=r_c {
-                    w.generate_chunk(cc + IVec3::new(x, y, z));
+                    let cp = cc + IVec3::new(x, y, z);
+                    let (min_m, max_m) = chunk_bounds_m(cp);
+                    for (key, a) in bodies_overlapping(min_m, max_m) {
+                        w.generate_chunk(key, &a, cp);
+                    }
                 }
             }
         }
+        w.refresh_nearby(center, r_m + 80.0);
     }
 
     #[test]
@@ -1603,32 +2093,41 @@ mod tests {
         w.set_air(v);
         assert!(!w.solid(v));
         // Unload the chunk entirely: fallback path must still honor the edit.
+        let home = asteroid_in_cell(IVec3::ZERO).unwrap();
         let cp = chunk_of(v);
-        w.unload_chunk(cp);
+        w.unload_chunk(IVec3::ZERO, cp);
         assert!(!w.solid(v), "edit must survive via fallback");
         // Regenerate: the edit must be baked back into chunk storage.
-        w.generate_chunk(cp);
+        w.generate_chunk(IVec3::ZERO, &home, cp);
         assert!(!w.solid(v), "edit must survive regeneration");
     }
 
     #[test]
-    fn vacuum_chunks_are_cheap_and_air() {
+    fn empty_space_is_air_and_bodies_move_with_offsets() {
         let mut w = VoxelWorld::default();
-        // Pick a chunk far from any cell center but inside no asteroid: probe
-        // a few until one is vacuum (the field is ~50% dense per CELL, and
-        // cells are 14 chunks wide — most chunks are vacuum).
-        let mut found = false;
-        for i in 0..200 {
-            let cp = IVec3::new(40 + i * 3, 7, -9);
-            if !w.generate_chunk(cp) {
-                assert!(w.is_loaded(cp));
-                let v = cp * CHUNK + IVec3::splat(8);
-                assert_eq!(w.block(v), AIR);
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "expected to find at least one vacuum chunk");
+        // Far empty space: nothing nearby, everything is vacuum.
+        w.refresh_nearby(Vec3::new(20_000.0, 9_000.0, -14_000.0), 100.0);
+        assert_eq!(w.block(IVec3::new(80_000, 36_000, -56_000)), AIR);
+
+        // A displaced body answers at its NEW location with its own terrain.
+        let (cell, a) = nearest_asteroid_keyed(Vec3::ZERO, true).expect("starter exists");
+        let shift = IVec3::new(400, 0, 0); // 100m — well clear of the original
+        let mut m = BodyMotion::default();
+        m.offset = shift.as_vec3() * VOXEL;
+        m.off_vox = shift;
+        w.motion_mut().insert(cell, m);
+        w.refresh_nearby(a.center + m.offset, 90.0);
+        let gen_v = (a.center / VOXEL).floor().as_ivec3();
+        let world_v = gen_v + shift;
+        assert_eq!(w.block(world_v), block_at(gen_v), "terrain rides the offset");
+        assert_ne!(w.block(world_v), AIR, "asteroid core should be solid");
+        assert_eq!(w.env_of(world_v), (a.tier, a.species));
+
+        // Consumption drops the body for real.
+        w.consume_body(cell);
+        w.refresh_nearby(a.center + shift.as_vec3() * VOXEL, 90.0);
+        assert_eq!(w.block(world_v), AIR, "eaten bodies leave vacuum");
+        assert!(w.is_eaten(cell));
     }
 
     /// Chunk contents must equal pure worldgen everywhere (the block()
@@ -1638,16 +2137,10 @@ mod tests {
     fn chunk_storage_matches_pure_gen() {
         let mut w = VoxelWorld::default();
         for &(c, r) in &[(Vec3::ZERO, 22.0), (Vec3::new(33.0, 31.0, -31.0), 18.0)] {
-            let rc = (r / CHUNK_M).ceil() as i32;
-            let cc = chunk_of((c / VOXEL).floor().as_ivec3());
-            for z in -rc..=rc {
-                for y in -rc..=rc {
-                    for x in -rc..=rc {
-                        w.generate_chunk(cc + IVec3::new(x, y, z));
-                    }
-                }
-            }
+            gen_sphere(&mut w, c, r);
         }
+        // One nearby list covering both probe regions (offsets are all zero).
+        w.refresh_nearby(Vec3::new(16.0, 15.0, -15.0), 120.0);
         let mut mismatches = 0;
         for &(cx, cy, cz) in &[(0i32, 40i32, 0i32), (132, 124, -124)] {
             for dy in -20..20 {
@@ -1689,6 +2182,7 @@ mod tests {
     fn bench_chunk_gen_and_mesh() {
         use std::time::Instant;
         let mut w = VoxelWorld::default();
+        let home = asteroid_in_cell(IVec3::ZERO).unwrap();
         let cc = chunk_of((Vec3::ZERO / VOXEL).floor().as_ivec3());
         let r = 4; // 9^3 chunks around home = mix of rock + vacuum
         let mut rock_chunks = Vec::new();
@@ -1698,7 +2192,7 @@ mod tests {
             for y in -r..=r {
                 for x in -r..=r {
                     let cp = cc + IVec3::new(x, y, z);
-                    if w.generate_chunk(cp) {
+                    if w.generate_chunk(IVec3::ZERO, &home, cp) {
                         rock_chunks.push(cp);
                     }
                 }
@@ -1709,7 +2203,7 @@ mod tests {
 
         let t = Instant::now();
         for cp in &rock_chunks {
-            let _ = mesh_chunk(&w, *cp);
+            let _ = mesh_chunk(&w, IVec3::ZERO, &home, *cp);
         }
         let mesh_ms = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -1732,8 +2226,9 @@ mod tests {
         // fully inside the rock would correctly mesh to nothing (all faces
         // culled), so the deep-interior chunk is the wrong thing to assert on.
         let spawn = home_spawn();
+        let home = asteroid_in_cell(IVec3::ZERO).unwrap();
         let cp = chunk_of((spawn / VOXEL).floor().as_ivec3());
-        let (solid, _glow) = mesh_chunk(&w, cp);
+        let (solid, _glow) = mesh_chunk(&w, IVec3::ZERO, &home, cp);
         assert!(solid.count_vertices() > 0);
     }
 }

@@ -188,6 +188,26 @@ impl BlackHole {
     }
 }
 
+/// Analytic (center, gm) at any point in the day — single source of truth
+/// for the live clock AND for world.rs backfilling the infall a body
+/// suffered before it was first tracked.
+pub fn hole_kinematics(elapsed: f32, day_len: f32) -> (Vec3, f32) {
+    let frac = (elapsed / day_len).clamp(0.0, 1.0);
+    let ot = (elapsed - day_len).max(0.0);
+    if ot <= 0.0 {
+        let b = BlackHole::at(frac);
+        (b.center, b.gm)
+    } else {
+        let v_end = 1.6 * (DIST_START - DIST_END) / day_len;
+        let dist = DIST_END - v_end * (ot + ot * ot / 80.0);
+        let gm_end = PULL_HOME_END * DIST_END * DIST_END;
+        (
+            BH_DIR.normalize() * dist,
+            gm_end * 2.0f32.powf(ot / OVERTIME_DOUBLE_S),
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -964,22 +984,12 @@ fn day_cycle(
             day.elapsed += dt;
             let frac = day.frac();
             let ot = day.overtime();
-            if ot <= 0.0 {
-                let next = BlackHole::at(frac);
-                bh.center = next.center;
-                bh.gm = next.gm;
-            } else {
-                // OVERTIME — no timer, just physics with the gloves off. The
-                // hole keeps advancing along its ray at its end-of-day speed
-                // (accelerating), sweeping the field and engulfing anything
-                // braced against rock; its mass doubles every 45s so a
-                // flee-er's pull deficit always closes.
-                let v_end = 1.6 * (DIST_START - DIST_END) / day.day_len;
-                let dist = DIST_END - v_end * (ot + ot * ot / 80.0);
-                bh.center = BH_DIR.normalize() * dist;
-                let gm_end = PULL_HOME_END * DIST_END * DIST_END;
-                bh.gm = gm_end * 2.0f32.powf(ot / OVERTIME_DOUBLE_S);
-            }
+            // (Overtime — no timer, just physics with the gloves off: the
+            // hole keeps advancing, sweeping the field, gm doubling so a
+            // flee-er's pull deficit always closes.)
+            let (center, gm) = hole_kinematics(day.elapsed, day.day_len);
+            bh.center = center;
+            bh.gm = gm;
 
             // Threshold warnings — the collapse must never be a surprise.
             let mins = (day.remaining() / 60.0).floor() as i32;
